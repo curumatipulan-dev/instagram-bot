@@ -1,0 +1,15 @@
+{
+  "name": "instagram-bot",
+  "version": "1.0.0",
+  "description": "Bot automat pentru Instagram",
+  "main": "instagram-bot.js",
+  "scripts": {
+    "start": "node instagram-bot.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0"
+  },
+  "keywords": ["instagram", "bot", "automation"],
+  "author": "Numele Tau",
+  "license": "MIT"
+}
