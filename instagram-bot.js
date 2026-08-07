@@ -18,12 +18,53 @@
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
+const crypto = require('crypto');
 const { IgApiClient, IgLoginTwoFactorRequiredError, IgCheckpointError } = require('instagram-private-api');
 
 // ===================== CONFIG =====================
 
-const SESSION_FILE = path.join(__dirname, 'session.json');
-const NOTEPAD_FILE = path.join(__dirname, 'notepad.json');
+// ---- .env, fara dependinte externe (util pe VPS / hosting) ----
+function loadEnvFile() {
+    const file = path.join(__dirname, '.env');
+    if (!fs.existsSync(file)) return;
+    for (const raw of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+        const line = raw.trim();
+        if (!line || line.startsWith('#')) continue;
+        const eq = line.indexOf('=');
+        if (eq === -1) continue;
+        const key = line.slice(0, eq).trim();
+        let value = line.slice(eq + 1).trim();
+        if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+            value = value.slice(1, -1);
+        }
+        if (!(key in process.env)) process.env[key] = value;
+    }
+}
+loadEnvFile();
+
+const ARGS = process.argv.slice(2);
+const hasFlag = (name) => ARGS.includes(name);
+const envBool = (v) => /^(1|true|yes|da|on)$/i.test(String(v || ''));
+
+// Unde se scriu sesiunea, notitele si imaginile. Pe VPS poti monta un volum.
+const DATA_DIR = process.env.IG_DATA_DIR ? path.resolve(process.env.IG_DATA_DIR) : __dirname;
+try { if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
+
+// Headless = fara terminal interactiv (pm2, systemd, docker, nohup).
+// In acest mod datele de login vin din variabile de mediu / .env.
+const HEADLESS = hasFlag('--headless')
+    ? true
+    : process.env.IG_HEADLESS !== undefined
+        ? envBool(process.env.IG_HEADLESS)
+        : !process.stdin.isTTY;
+const AUTO_START = hasFlag('--auto')
+    ? true
+    : process.env.IG_AUTO_START !== undefined
+        ? envBool(process.env.IG_AUTO_START)
+        : HEADLESS;
+
+const SESSION_FILE = path.join(DATA_DIR, 'session.json');
+const NOTEPAD_FILE = path.join(DATA_DIR, 'notepad.json');
 const PREFIX = '$';
 const POLL_INTERVAL_MS = 20000;  // cat de des verifica inboxul (Instagram da 467 daca ceri prea des)
 const POLL_JITTER_MS = 8000;     // variatie aleatoare, ca sa nu para trafic de bot
@@ -42,7 +83,8 @@ let lastSendTime = 0;
 let pollBackoff = 0;      // pauza curenta impusa de erori (ms)
 let pollErrors = 0;       // erori consecutive la citirea inboxului
 let cli = null;           // interfata de comenzi din consola
-let inputBusy = false;    // true cat timp cerem username/parola/cod (consola nu mai citeste comenzi)
+let inputBusy = false;
+let loginInProgress = false;  // true cat timp se face login (comenzile din terminal asteapta)    // true cat timp cerem username/parola/cod (consola nu mai citeste comenzi)
 const startTime = Date.now();
 
 // ===================== STARI =====================
@@ -164,9 +206,14 @@ notepad = loadNotepad();
 
 // ===================== FRAZE =====================
 
+function phraseFile(file) {
+    const inData = path.join(DATA_DIR, file);
+    return fs.existsSync(inData) ? inData : path.join(__dirname, file);
+}
+
 function loadPhrases(file) {
     try {
-        return fs.readFileSync(path.join(__dirname, file), 'utf8')
+        return fs.readFileSync(phraseFile(file), 'utf8')
             .split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
     } catch {
         return [];
@@ -174,6 +221,10 @@ function loadPhrases(file) {
 }
 
 function ask(question, hidden) {
+    if (HEADLESS) {
+        log(`Nu pot cere interactiv "${question.trim()}" in mod headless. Completeaza .env (IG_USERNAME, IG_PASSWORD, IG_TOTP_SECRET).`, 'error');
+        return Promise.resolve('');
+    }
     // Cat timp intrebam ceva, oprim ascultatorul de comenzi din consola.
     // Altfel el citeste acelasi rand si raspunde "Comanda necunoscuta",
     // iar username-ul/parola ajung in consola in loc sa ajunga la login.
@@ -213,6 +264,42 @@ function ask(question, hidden) {
         };
         stdin.on('data', onData);
     });
+}
+
+// ===================== 2FA AUTOMAT (TOTP) =====================
+
+// Genereaza codul din aplicatia de autentificare, plecand de la secretul base32.
+// Asa botul se poate reloga singur pe VPS, fara sa ceara cod la tastatura.
+function base32Decode(input) {
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+    const clean = String(input || '').toUpperCase().replace(/[^A-Z2-7]/g, '');
+    let bits = 0;
+    let value = 0;
+    const out = [];
+    for (const ch of clean) {
+        const idx = alphabet.indexOf(ch);
+        if (idx === -1) continue;
+        value = (value << 5) | idx;
+        bits += 5;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push((value >>> bits) & 0xff);
+        }
+    }
+    return Buffer.from(out);
+}
+
+function totpCode(secret, atMs) {
+    const key = base32Decode(secret);
+    if (!key.length) return '';
+    const counter = Math.floor((atMs || Date.now()) / 1000 / 30);
+    const buf = Buffer.alloc(8);
+    buf.writeUInt32BE(Math.floor(counter / 0x100000000), 0);
+    buf.writeUInt32BE(counter >>> 0, 4);
+    const hmac = crypto.createHmac('sha1', key).update(buf).digest();
+    const offset = hmac[hmac.length - 1] & 0x0f;
+    const bin = ((hmac[offset] & 0x7f) << 24) | (hmac[offset + 1] << 16) | (hmac[offset + 2] << 8) | hmac[offset + 3];
+    return String(bin % 1000000).padStart(6, '0');
 }
 
 // ===================== SESIUNE =====================
@@ -264,8 +351,8 @@ async function login() {
         return true;
     }
 
-    const username = await ask('Username Instagram: ');
-    const password = await ask('Parola Instagram (ascunsa): ', true);
+    const username = (process.env.IG_USERNAME || '').trim() || await ask('Username Instagram: ');
+    const password = process.env.IG_PASSWORD || await ask('Parola Instagram (ascunsa): ', true);
     if (!username || !password) {
         log('Username sau parola lipsa.', 'error');
         return false;
@@ -287,15 +374,24 @@ async function login() {
     } catch (err) {
         if (err instanceof IgLoginTwoFactorRequiredError) {
             const info = err.response.body.two_factor_info;
-            const code = await ask('Cod 2FA (din SMS sau aplicatie): ');
+            let code = '';
+            if (process.env.IG_TOTP_SECRET) {
+                code = totpCode(process.env.IG_TOTP_SECRET);
+                log('Cod 2FA generat automat din IG_TOTP_SECRET.');
+            } else {
+                code = await ask('Cod 2FA (din SMS sau aplicatie): ');
+            }
             try {
-                user = await ig.account.login2FA({
+                // Numele corect in instagram-private-api este twoFactorLogin,
+                // iar raspunsul e body-ul brut, nu obiectul user.
+                const res = await ig.account.twoFactorLogin({
                     username: USERNAME,
                     verificationCode: code,
                     twoFactorIdentifier: info.two_factor_identifier,
-                    verificationMethod: info.totp_two_factor_on ? '0' : '1',
+                    verificationMethod: (process.env.IG_TOTP_SECRET || info.totp_two_factor_on) ? '0' : '1',
                     trustThisDevice: '1',
                 });
+                user = res.logged_in_user || await ig.account.currentUser();
             } catch (e2) {
                 log(`Cod 2FA respins: ${e2.message}`, 'error');
                 return false;
@@ -358,11 +454,31 @@ async function sendToUser(userId, text) {
     }
 }
 
+// instagram-private-api nu expune o metoda de reactie, deci apelam direct
+// endpointul folosit de aplicatie.
 async function likeItem(threadId, itemId) {
+    if (!threadId || !itemId) return false;
     try {
-        await ig.entity.directThread(String(threadId)).broadcastReaction(String(itemId), LIKE_EMOJI);
+        await ig.request.send({
+            url: '/api/v1/direct_v2/threads/broadcast/reaction/',
+            method: 'POST',
+            form: ig.request.sign({
+                thread_ids: JSON.stringify([String(threadId)]),
+                item_id: String(itemId),
+                node_type: 'item',
+                reaction_type: 'like',
+                reaction_status: 'created',
+                emoji: LIKE_EMOJI,
+                action: 'send_item',
+                client_context: ig.state.clientSessionId,
+                mutation_token: String(Date.now()),
+                _csrftoken: ig.state.cookieCsrfToken,
+                _uuid: ig.state.uuid,
+            }),
+        });
         return true;
-    } catch {
+    } catch (e) {
+        log(`Nu am putut da like la mesaj: ${e.message}`, 'warn');
         return false;
     }
 }
@@ -382,7 +498,7 @@ async function resolveUser(name) {
 
 async function saveImageFromUrl(url, sender, isViewOnce) {
     try {
-        const dir = path.join(__dirname, isViewOnce ? 'view_once' : 'saved_images');
+        const dir = path.join(DATA_DIR, isViewOnce ? 'view_once' : 'saved_images');
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
         const res = await fetch(url);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -494,11 +610,14 @@ function statusText() {
 
 // ===================== HANDLER COMENZI =====================
 
-async function handleCommand(threadId, senderId, senderName, rawText) {
-    const parts = rawText.slice(PREFIX.length).trim().split(/\s+/);
+// replyFn permite rularea aceleiasi comenzi din terminal:
+// raspunsul se scrie in consola in loc sa plece intr-un DM.
+async function handleCommand(threadId, senderId, senderName, rawText, replyFn) {
+    const body = rawText.startsWith(PREFIX) ? rawText.slice(PREFIX.length) : rawText;
+    const parts = body.trim().split(/\s+/);
     const cmd = (parts.shift() || '').toLowerCase();
     const args = parts;
-    const reply = (msg) => sendToThread(threadId, msg);
+    const reply = replyFn || ((msg) => sendToThread(threadId, msg));
 
     switch (cmd) {
         case 'help':
@@ -717,7 +836,7 @@ async function handleCommand(threadId, senderId, senderName, rawText) {
         }
 
         case 'vvclear': {
-            const dir = path.join(__dirname, 'view_once');
+            const dir = path.join(DATA_DIR, 'view_once');
             let count = 0;
             try {
                 if (fs.existsSync(dir)) {
@@ -981,7 +1100,9 @@ async function pollInbox() {
 async function start() {
     if (running) { log('Botul ruleaza deja.', 'warn'); return; }
     if (!loggedIn) {
-        const ok = await login();
+        loginInProgress = true;
+        let ok = false;
+        try { ok = await login(); } finally { loginInProgress = false; }
         if (!ok) { log('Nu m-am putut conecta. Verifica datele si incearca din nou cu "start".', 'error'); return; }
     }
     spamPhrases = loadPhrases('spam.txt');
@@ -1005,17 +1126,64 @@ function stop() {
 function consoleHelp() {
     console.log([
         '',
-        'COMENZI CONSOLA',
-        '  start   - porneste botul (cere login prima data)',
-        '  stop    - opreste botul',
-        '  status  - afiseaza starea botului',
-        '  logout  - sterge sesiunea salvata',
-        '  help    - acest mesaj',
-        '  exit    - inchide programul',
+        'COMENZI CONSOLA (control)',
+        '  start    - porneste botul (cere login prima data)',
+        '  stop     - opreste botul',
+        '  status   - afiseaza starea botului',
+        '  logout   - sterge sesiunea salvata',
+        '  help     - acest mesaj',
+        '  commands - lista completa a comenzilor de bot',
+        '  exit     - inchide programul',
+        '',
+        'COMENZI DE BOT DIN TERMINAL',
+        `  Orice comanda ${PREFIX} merge si aici, cu sau fara prefix.`,
+        `  Exemple: ${PREFIX}spam user text | mock user | note list | clearall`,
+        '  Raspunsul apare in terminal, actiunea se executa pe Instagram.',
         '',
         `In DM foloseste prefixul ${PREFIX}. Scrie ${PREFIX}help intr-un chat si botul raspunde acolo.`,
         '',
     ].join('\n'));
+}
+
+// Comenzi de bot rulate din terminal: acelasi handler ca in DM,
+// doar ca raspunsul se scrie in consola.
+const NEEDS_LOGIN = new Set([
+    'reply', 'stopreply', 'spam', 'mock', 'stopmock', 'copymsg', 'stopcopy',
+    'autolike', 'stopautolike', 'mention', 'target',
+]);
+
+// Comenzile din terminal se executa una dupa alta, in ordinea scrierii.
+let consoleQueue = Promise.resolve();
+
+function queueBotCommand(raw) {
+    consoleQueue = consoleQueue.then(() => runBotCommand(raw)).catch((e) => {
+        log(`Comanda a esuat: ${e && e.message ? e.message : e}`, 'error');
+    });
+}
+
+async function runBotCommand(raw) {
+    const clean = raw.trim();
+    if (!clean) return;
+    const name = clean.replace(new RegExp(`^\\${PREFIX}`), '').trim().split(/\s+/)[0].toLowerCase();
+    if (NEEDS_LOGIN.has(name) && !loggedIn) {
+        // daca tocmai se face login (pornire automata), asteptam sa se termine
+        if (loginInProgress) {
+            log('Astept sa se termine loginul...');
+            for (let i = 0; i < 120 && loginInProgress; i += 1) await sleep(1000);
+        }
+        if (!loggedIn) {
+            console.log('Trebuie sa fii conectat. Scrie "start" mai intai.');
+            return;
+        }
+    }
+    try {
+        await handleCommand('', String(myUserId || 'console'), USERNAME || 'consola', clean, (msg) => {
+            console.log(`\n${msg}\n`);
+            return true;
+        });
+    } catch (e) {
+        log(`Comanda a esuat: ${e.message}`, 'error');
+    }
 }
 
 const consoleCommands = {
@@ -1027,31 +1195,48 @@ const consoleCommands = {
         try { fs.unlinkSync(SESSION_FILE); log('Sesiune stearsa.', 'ok'); } catch { log('Nu exista sesiune salvata.', 'warn'); }
         loggedIn = false;
     },
+    commands: () => console.log(`\n${helpText()}\n`),
+    comenzi: () => console.log(`\n${helpText()}\n`),
     exit: () => { stop(); process.exit(0); },
+    quit: () => { stop(); process.exit(0); },
 };
 
 cli = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
 cli.on('line', (line) => {
     if (inputBusy) return; // randul apartine unei intrebari de login
-    const cmd = line.trim().toLowerCase();
-    if (!cmd) return;
-    if (consoleCommands[cmd]) consoleCommands[cmd]();
-    else console.log(`Comanda necunoscuta: "${cmd}". Scrie "help".`);
+    const raw = line.trim();
+    if (!raw) return;
+    const key = raw.toLowerCase();
+    // comenzile de control merg doar fara argumente si fara prefix
+    if (!raw.startsWith(PREFIX) && consoleCommands[key]) { consoleCommands[key](); return; }
+    queueBotCommand(raw);
 });
+cli.on('close', () => { /* stdin inchis (nohup/systemd): botul continua sa ruleze */ });
 
 process.on('SIGINT', () => { stop(); process.exit(0); });
+process.on('SIGTERM', () => { stop(); process.exit(0); });
 process.on('uncaughtException', (err) => log(`Exceptie: ${err.message}`, 'error'));
 process.on('unhandledRejection', (err) => log(`Promisiune respinsa: ${err && err.message ? err.message : err}`, 'error'));
 
 console.log([
     '',
     '==============================',
-    '   INSTAGRAM BOT - TERMUX',
+    '   INSTAGRAM BOT',
     '==============================',
+    '',
+    `Mod: ${HEADLESS ? 'headless (server / VPS)' : 'interactiv (terminal)'}`,
+    `Date salvate in: ${DATA_DIR}`,
     '',
     'Scrie "start" pentru a porni botul.',
     'Scrie "help" pentru comenzile din consola.',
+    `Orice comanda de bot merge si aici (ex: "${PREFIX}status" sau "status").`,
     '',
 ].join('\n'));
 
-if (process.argv.includes('--auto')) start();
+if (AUTO_START) {
+    if (HEADLESS && !fs.existsSync(SESSION_FILE) && !process.env.IG_USERNAME) {
+        log('Mod headless fara sesiune salvata si fara IG_USERNAME/IG_PASSWORD in .env. Nu pot face login.', 'error');
+    } else {
+        start();
+    }
+}
