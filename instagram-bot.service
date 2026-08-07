@@ -1,0 +1,25 @@
+# systemd - VPS Linux
+#   sudo cp instagram-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now instagram-bot
+#   journalctl -u instagram-bot -f
+[Unit]
+Description=Instagram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/instagram-bot
+Environment=IG_HEADLESS=1
+Environment=IG_AUTO_START=1
+EnvironmentFile=-/opt/instagram-bot/.env
+ExecStart=/usr/bin/node /opt/instagram-bot/instagram-bot.js --headless --auto
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
