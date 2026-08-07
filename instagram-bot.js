@@ -25,7 +25,9 @@ const { IgApiClient, IgLoginTwoFactorRequiredError, IgCheckpointError } = requir
 const SESSION_FILE = path.join(__dirname, 'session.json');
 const NOTEPAD_FILE = path.join(__dirname, 'notepad.json');
 const PREFIX = '$';
-const POLL_INTERVAL_MS = 4000;   // cat de des verifica inboxul
+const POLL_INTERVAL_MS = 20000;  // cat de des verifica inboxul (Instagram da 467 daca ceri prea des)
+const POLL_JITTER_MS = 8000;     // variatie aleatoare, ca sa nu para trafic de bot
+const MAX_BACKOFF_MS = 15 * 60 * 1000; // pauza maxima dupa erori repetate
 const MIN_SEND_GAP_MS = 2500;    // pauza minima intre 2 mesaje trimise
 const LIKE_EMOJI = '\u2764\ufe0f'; // reactia "inima" ceruta de API
 
@@ -37,6 +39,8 @@ let running = false;
 let loggedIn = false;
 let pollTimer = null;
 let lastSendTime = 0;
+let pollBackoff = 0;      // pauza curenta impusa de erori (ms)
+let pollErrors = 0;       // erori consecutive la citirea inboxului
 const startTime = Date.now();
 
 // ===================== STARI =====================
@@ -833,6 +837,21 @@ async function handleAutoFeatures(threadId, senderId, senderName, text) {
 
 // ===================== POLLING INBOX =====================
 
+// Extrage codul HTTP dintr-o eroare a bibliotecii instagram-private-api.
+function errorStatus(e) {
+    const direct = e && e.response && e.response.statusCode;
+    if (direct) return Number(direct);
+    const m = String((e && e.message) || '').match(/\b(4\d\d|5\d\d)\b/);
+    return m ? Number(m[1]) : 0;
+}
+
+// Intervalul pana la urmatoarea verificare: interval de baza + variatie
+// aleatoare, plus pauza impusa daca Instagram ne-a limitat.
+function nextPollDelay() {
+    if (pollBackoff > 0) return pollBackoff + Math.floor(Math.random() * POLL_JITTER_MS);
+    return POLL_INTERVAL_MS + Math.floor(Math.random() * POLL_JITTER_MS);
+}
+
 async function pollInbox() {
     if (!running) return;
     try {
@@ -902,12 +921,40 @@ async function pollInbox() {
                 await handleAutoFeatures(threadId, senderId, senderName, text);
             }
         }
+        // citire reusita: resetam orice pauza impusa de erori
+        pollErrors = 0;
+        pollBackoff = 0;
     } catch (e) {
-        log(`Eroare la citirea inboxului: ${e.message}`, 'error');
+        pollErrors += 1;
+        const code = errorStatus(e);
+
+        if (code === 467 || code === 429) {
+            // Instagram a limitat contul/IP-ul. Nu insistam: crestem pauza.
+            pollBackoff = Math.min(pollBackoff ? pollBackoff * 2 : 60000, MAX_BACKOFF_MS);
+            log(`Instagram a limitat cererile (cod ${code}). Pauza ${Math.round(pollBackoff / 1000)}s inainte de urmatoarea verificare.`, 'warn');
+        } else if (e instanceof IgCheckpointError || /checkpoint|challenge/i.test(String(e.message))) {
+            // Cont blocat pana confirmi in aplicatia oficiala.
+            log('Instagram cere verificare de securitate. Deschide aplicatia oficiala, confirma ca esti tu, apoi scrie "start" din nou.', 'error');
+            stop();
+            return;
+        } else if (/login_required|not logged|sessionid/i.test(String(e.message))) {
+            log('Sesiunea a expirat. Scrie "logout" apoi "start" ca sa te conectezi din nou.', 'error');
+            stop();
+            return;
+        } else {
+            pollBackoff = Math.min(pollBackoff ? pollBackoff * 2 : 15000, MAX_BACKOFF_MS);
+            log(`Eroare la citirea inboxului: ${e.message}. Reincerc peste ${Math.round(pollBackoff / 1000)}s.`, 'error');
+        }
+
+        if (pollErrors >= 20) {
+            log('Prea multe erori consecutive. Opresc botul ca sa nu agravez restrictia.', 'error');
+            stop();
+            return;
+        }
     }
 
     if (seenItems.size > 5000) seenItems.clear();
-    if (running) pollTimer = setTimeout(pollInbox, POLL_INTERVAL_MS);
+    if (running) pollTimer = setTimeout(pollInbox, nextPollDelay());
 }
 
 // ===================== CONTROL =====================
@@ -922,6 +969,8 @@ async function start() {
     replyWords = loadPhrases('reply.txt');
     beefPhrases = loadPhrases('beef.txt');
     running = true;
+    pollErrors = 0;
+    pollBackoff = 0;
     log(`Bot pornit. Scrie ${PREFIX}help intr-un DM ca sa primesti lista de comenzi in acel chat.`, 'ok');
     pollInbox();
 }
