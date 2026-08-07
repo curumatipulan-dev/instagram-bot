@@ -1,7 +1,7 @@
 {
   "name": "instagram-bot",
-  "version": "3.0.0",
-  "description": "Bot Instagram cu login secvențial, 2FA și sesiune persistentă",
+  "version": "4.0.0",
+  "description": "Bot Instagram pentru Termux, cu login 2FA, sesiune persistenta si comenzi in DM",
   "main": "instagram-bot.js",
   "scripts": {
     "start": "node instagram-bot.js"
@@ -10,10 +10,13 @@
     "node": ">=18"
   },
   "dependencies": {
-    "instagram-private-api": "^1.46.1",
-    "readline-sync": "^1.4.10"
+    "instagram-private-api": "^1.46.1"
   },
-  "keywords": ["instagram", "bot", "automation"],
+  "keywords": [
+    "instagram",
+    "bot",
+    "termux"
+  ],
   "author": "curumatipulan-dev",
   "license": "MIT"
 }
