@@ -1,5 +1,12 @@
 node_modules/
 session.json
+notepad.json
+.env
+data/
+saved_images/
+view_once/
 reply.txt
+spam.txt
+beef.txt
 *.log
 .DS_Store
