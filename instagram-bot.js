@@ -23,6 +23,7 @@ const { IgApiClient, IgLoginTwoFactorRequiredError, IgCheckpointError } = requir
 // ===================== CONFIG =====================
 
 const SESSION_FILE = path.join(__dirname, 'session.json');
+const NOTEPAD_FILE = path.join(__dirname, 'notepad.json');
 const PREFIX = '$';
 const POLL_INTERVAL_MS = 4000;   // cat de des verifica inboxul
 const MIN_SEND_GAP_MS = 2500;    // pauza minima intre 2 mesaje trimise
@@ -65,6 +66,7 @@ let beefPhrases = [];
 const savedImages = [];
 const seenItems = new Set();      // id-uri de mesaje deja procesate
 const threadCursor = {};          // thread_id -> timestamp ultimului mesaj procesat
+let notepad = { notes: {} };      // user_id -> lista note personale
 
 // ===================== UTILS =====================
 
@@ -90,6 +92,71 @@ function mockText(text) {
 function reverseText(text) {
     return text.split('').reverse().join('');
 }
+
+// ===================== NOTEPAD =====================
+
+function loadNotepad() {
+    if (!fs.existsSync(NOTEPAD_FILE)) return { notes: {} };
+    try {
+        const data = JSON.parse(fs.readFileSync(NOTEPAD_FILE, 'utf8'));
+        if (data && typeof data.notes === 'object') return data;
+        return { notes: {} };
+    } catch {
+        return { notes: {} };
+    }
+}
+
+function saveNotepad() {
+    try {
+        fs.writeFileSync(NOTEPAD_FILE, JSON.stringify(notepad, null, 2));
+    } catch (e) {
+        log(`Nu am putut salva notepad: ${e.message}`, 'warn');
+    }
+}
+
+function notepadHelp() {
+    return [
+        'NOTEPAD - comenzi',
+        '$note add [text] - adauga o notita',
+        '$note list - arata toate notitele tale',
+        '$note delete [numar] - sterge notita cu numarul respectiv',
+        '$note clear - sterge toate notitele',
+        '$note help - ajutor notepad',
+    ].join('\n');
+}
+
+function notepadList(userId) {
+    const list = notepad.notes[userId] || [];
+    if (!list.length) return 'Notepadul tau este gol.';
+    return ['Notitele tale:', ...list.map((n, i) => `${i + 1}. ${n.text}`)].join('\n');
+}
+
+function notepadAdd(userId, text) {
+    if (!text.trim()) return 'Textul notei este gol.';
+    if (!notepad.notes[userId]) notepad.notes[userId] = [];
+    notepad.notes[userId].push({ text: text.trim(), createdAt: Date.now() });
+    saveNotepad();
+    return `Notita adaugata. Ai ${notepad.notes[userId].length} notite.`;
+}
+
+function notepadDelete(userId, index) {
+    const list = notepad.notes[userId] || [];
+    if (index < 1 || index > list.length) return `Numar invalid. Ai ${list.length} notite.`;
+    const removed = list.splice(index - 1, 1);
+    if (!list.length) delete notepad.notes[userId];
+    saveNotepad();
+    return `Notita stearsa: ${removed[0].text}`;
+}
+
+function notepadClear(userId) {
+    delete notepad.notes[userId];
+    saveNotepad();
+    return 'Toate notitele tale au fost sterse.';
+}
+
+notepad = loadNotepad();
+
+// ===================== FRAZE =====================
 
 function loadPhrases(file) {
     try {
@@ -355,6 +422,12 @@ function helpText() {
         '$vvlist - lista imaginilor salvate',
         '$vvclear - sterge imaginile view once salvate',
         '',
+        'NOTEPAD (notite personale)',
+        '$note add [text] - adauga o notita',
+        '$note list - arata notitele tale',
+        '$note delete [numar] - sterge o notita',
+        '$note clear - sterge toate notitele',
+        '',
         'ALTELE',
         '$afk [motiv] - activeaza modul afk',
         '$stopafk - opreste modul afk',
@@ -378,12 +451,14 @@ function helpText() {
 }
 
 function statusText() {
+    const totalNotes = Object.values(notepad.notes).reduce((sum, list) => sum + list.length, 0);
     return [
         'STATUS BOT',
         `Utilizator: @${USERNAME}`,
         `Ruleaza: ${running ? 'da' : 'nu'}`,
         `Uptime: ${uptime()}`,
         `Imagini salvate: ${savedImages.length}`,
+        `Notite salvate: ${totalNotes}`,
         `Targete reply: ${replyState.targets.length}`,
         `Spam: ${spamState.running ? 'activ' : 'inactiv'}`,
         `Mock: ${Object.keys(mockTargets).length} targete`,
@@ -663,6 +738,36 @@ async function handleCommand(threadId, senderId, senderName, rawText) {
                 `Mention: ${mentionTargetName || 'niciunul'}`,
                 `Tinta manuala: ${manualTargetName || 'niciuna'}`,
             ].join('\n'));
+
+        case 'note':
+        case 'notes':
+        case 'notepad': {
+            const sub = (args.shift() || '').toLowerCase();
+            const rest = args.join(' ');
+            switch (sub) {
+                case 'add':
+                case 'adauga':
+                    return reply(notepadAdd(senderId, rest));
+                case 'list':
+                case 'lista':
+                case '':
+                    return reply(notepadList(senderId));
+                case 'delete':
+                case 'sterge':
+                case 'del': {
+                    const idx = parseInt(args[0], 10);
+                    if (!Number.isFinite(idx)) return reply('Foloseste: $note delete [numar]');
+                    return reply(notepadDelete(senderId, idx));
+                }
+                case 'clear':
+                case 'curata':
+                    return reply(notepadClear(senderId));
+                case 'help':
+                case '?':
+                default:
+                    return reply(notepadHelp());
+            }
+        }
 
         case 'clearall':
             replyState.running = false;
