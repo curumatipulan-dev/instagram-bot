@@ -1,755 +1,735 @@
-// ===================== INSTAGRAM BOT CU LOGIN INTERACTIV =====================
-// Salvează ca: instagram-bot.js
-// Rulează cu: node instagram-bot.js
+#!/usr/bin/env node
+// ============================================================================
+//  INSTAGRAM BOT  -  v2 (rescris)
+//  Rulare:  npm install  &&  npm start
+//  Comenzi consolă: login / start / stop / status / whoami / logout / help / exit
+//  Comenzi în DM (doar de la contul tău): $help $status $ping $afk $reverse
+//                                          $reply $stopreply $mock $stopmock
+// ============================================================================
+
+'use strict';
 
 const fs = require('fs');
 const path = require('path');
-const axios = require('axios');
 const readline = require('readline');
+const axios = require('axios');
 
-// ===================== SETĂRI =====================
+// ===================== CONFIG =====================
 const SESSION_FILE = path.join(__dirname, 'session.json');
-const VIEW_ONCE_DIR = path.join(__dirname, 'view_once');
+const REPLY_FILE = path.join(__dirname, 'reply.txt');
 
-if (!fs.existsSync(VIEW_ONCE_DIR)) fs.mkdirSync(VIEW_ONCE_DIR, { recursive: true });
+const WEB = 'https://www.instagram.com';
+const API = `${WEB}/api/v1`;
+const IG_APP_ID = '936619743392459';
+const UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
 
-// ===================== STATE =====================
-let sessionId = null;
-let csrfToken = null;
-let userId = null;
-let username = '';
-let running = false;
-let lastMessageTime = 0;
-let viewOnceImages = [];
+const POLL_INTERVAL_MS = 8000;   // cât de des verific inbox-ul
+const SEND_COOLDOWN_MS = 2500;   // pauză minimă între 2 mesaje trimise
+const REPLY_COOLDOWN_MS = 6000;  // pauză minimă per conversație la auto-reply
 
-// Stări pentru funcții
-const replyState = { running: false, targets: [], lastReplyTime: {}, lineIndex: 0 };
-const spamState = { running: false, target: null, phraseIndex: 0, interval: null, delay: 5 };
-const afkState = { active: false, reason: '' };
-const mockTargets = {};
-const copyTargets = {};
-let reverseMode = false;
-let autoreactActive = {};
-
-// Liste pentru răspunsuri
-let replyPhrases = [];
-let spamPhrases = [];
+// ===================== STARE =====================
+const state = {
+  loggedIn: false,
+  running: false,
+  username: '',
+  userId: null,          // string
+  cookies: {},           // cookie jar simplu
+  lastSendAt: 0,
+  seenItems: new Set(),  // item_id-uri deja procesate
+  startedAt: Math.floor(Date.now() / 1000),
+  afk: { active: false, reason: '' },
+  reverse: false,
+  replyTargets: new Map(),  // userId -> username
+  mockTargets: new Map(),   // userId -> username
+  lastReplyAt: {},          // threadId -> ts
+  replyPhrases: [],
+  replyIndex: 0,
+};
 
 // ===================== UTILS =====================
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function log(msg, type = 'info') {
-    const prefix = type === 'error' ? '❌' : type === 'success' ? '✅' : type === 'warning' ? '⚠️' : '📌';
-    console.log(`${prefix} ${new Date().toLocaleTimeString()} - ${msg}`);
+  const icon =
+    type === 'error' ? '❌' : type === 'success' ? '✅' : type === 'warn' ? '⚠️ ' : '📌';
+  console.log(`${icon} ${new Date().toLocaleTimeString()} - ${msg}`);
 }
 
-function loadPhrases(file) {
-    try {
-        const data = fs.readFileSync(file, 'utf8');
-        return data.split(/\n/).map(l => l.trim()).filter(l => l.length > 0);
-    } catch { return []; }
+function mockText(t) {
+  return t
+    .split('')
+    .map((c, i) => (i % 2 === 0 ? c.toLowerCase() : c.toUpperCase()))
+    .join('');
 }
 
+function reverseText(t) {
+  return t.split('').reverse().join('');
+}
+
+function loadReplyPhrases() {
+  try {
+    state.replyPhrases = fs
+      .readFileSync(REPLY_FILE, 'utf8')
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+  } catch {
+    state.replyPhrases = [];
+  }
+  return state.replyPhrases.length;
+}
+
+// ===================== COOKIE JAR =====================
+function absorbCookies(res) {
+  const raw = res?.headers?.['set-cookie'];
+  if (!Array.isArray(raw)) return;
+  for (const line of raw) {
+    const [pair] = line.split(';');
+    const idx = pair.indexOf('=');
+    if (idx < 1) continue;
+    const name = pair.slice(0, idx).trim();
+    const value = pair.slice(idx + 1).trim();
+    if (!value || value === '""') delete state.cookies[name];
+    else state.cookies[name] = value;
+  }
+}
+
+function cookieHeader() {
+  return Object.entries(state.cookies)
+    .map(([k, v]) => `${k}=${v}`)
+    .join('; ');
+}
+
+function baseHeaders(extra = {}) {
+  const h = {
+    'User-Agent': UA,
+    Accept: '*/*',
+    'Accept-Language': 'ro-RO,ro;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Accept-Encoding': 'gzip, deflate', // fără "br": axios/node nu îl decodează mereu
+    'X-IG-App-ID': IG_APP_ID,
+    'X-ASBD-ID': '129',
+    'X-Requested-With': 'XMLHttpRequest',
+    'X-Instagram-AJAX': '1',
+    Origin: WEB,
+    Referer: `${WEB}/`,
+    ...extra,
+  };
+  if (state.cookies.csrftoken) h['X-CSRFToken'] = state.cookies.csrftoken;
+  const ck = cookieHeader();
+  if (ck) h.Cookie = ck;
+  return h;
+}
+
+async function request(method, url, { data, headers, form } = {}) {
+  const opts = {
+    method,
+    url,
+    timeout: 20000,
+    maxRedirects: 5,
+    validateStatus: () => true, // gestionăm noi codurile
+    headers: baseHeaders(headers),
+  };
+  if (form) {
+    opts.data = new URLSearchParams(form).toString();
+    opts.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+  } else if (data !== undefined) {
+    opts.data = data;
+    opts.headers['Content-Type'] = 'application/json';
+  }
+  const res = await axios(opts);
+  absorbCookies(res);
+  return res;
+}
+
+// ===================== SESIUNE =====================
 function saveSession() {
-    try {
-        fs.writeFileSync(SESSION_FILE, JSON.stringify({ sessionId, csrfToken, userId, username }));
-    } catch {}
+  try {
+    fs.writeFileSync(
+      SESSION_FILE,
+      JSON.stringify(
+        { username: state.username, userId: state.userId, cookies: state.cookies },
+        null,
+        2
+      )
+    );
+  } catch (e) {
+    log(`Nu am putut salva sesiunea: ${e.message}`, 'warn');
+  }
 }
 
-function loadSession() {
-    try {
-        const data = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8'));
-        sessionId = data.sessionId;
-        csrfToken = data.csrfToken;
-        userId = data.userId;
-        username = data.username;
-        return true;
-    } catch { return false; }
+function readSessionFile() {
+  try {
+    return JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8'));
+  } catch {
+    return null;
+  }
 }
 
-function mockText(text) {
-    return text.split('').map((c, i) => i % 2 === 0 ? c.toLowerCase() : c.toUpperCase()).join('');
+function clearSession() {
+  try {
+    fs.unlinkSync(SESSION_FILE);
+  } catch {}
+  state.cookies = {};
+  state.loggedIn = false;
+  state.username = '';
+  state.userId = null;
 }
 
-// ===================== INSTAGRAM API =====================
-const INSTAGRAM_API = 'https://i.instagram.com/api/v1';
+// ===================== PROMPT (un singur readline la un moment dat) =====================
+let cli = null;      // readline-ul de consolă
+let prompting = false;
 
-function getHeaders(extra = {}) {
-    return {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': '*/*',
-        'Accept-Language': 'ro-RO,ro;q=0.9,en;q=0.8',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'X-IG-App-ID': '936619743392459',
-        ...extra
+function startCli() {
+  if (cli) return;
+  cli = readline.createInterface({ input: process.stdin, output: process.stdout });
+  cli.setPrompt('> ');
+  cli.on('line', (line) => {
+    if (prompting) return; // în timpul login-ului nu interpretăm comenzi
+    handleConsoleCommand(line.trim()).finally(() => {
+      if (cli && !prompting) cli.prompt();
+    });
+  });
+  cli.on('close', () => process.exit(0));
+  cli.prompt();
+}
+
+function stopCli() {
+  if (!cli) return;
+  cli.close();
+  cli = null;
+}
+
+// Întreabă text simplu — închide CLI-ul ca să nu se suprapună inputurile.
+function ask(question) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
+}
+
+// Întreabă parola cu caractere ascunse.
+function askHidden(question) {
+  return new Promise((resolve) => {
+    const stdin = process.stdin;
+    const stdout = process.stdout;
+    stdout.write(question);
+
+    const wasRaw = stdin.isRaw;
+    if (stdin.isTTY) stdin.setRawMode(true);
+    stdin.resume();
+    stdin.setEncoding('utf8');
+
+    let value = '';
+    const done = (result) => {
+      stdin.removeListener('data', onData);
+      if (stdin.isTTY) stdin.setRawMode(!!wasRaw);
+      stdin.pause();
+      stdout.write('\n');
+      resolve(result);
     };
+
+    const onData = (chunk) => {
+      for (const ch of String(chunk)) {
+        if (ch === '\n' || ch === '\r' || ch === '\u0004') return done(value);
+        if (ch === '\u0003') { stdout.write('\n'); process.exit(0); }      // Ctrl+C
+        if (ch === '\u007F' || ch === '\b') {                              // Backspace
+          if (value.length) { value = value.slice(0, -1); stdout.write('\b \b'); }
+          continue;
+        }
+        value += ch;
+        stdout.write('*');
+      }
+    };
+
+    stdin.on('data', onData);
+  });
 }
 
 // ===================== LOGIN =====================
-async function loginInteractive() {
-    log('🔐 Conectare la Instagram...');
-    
-    // Verifică sesiune salvată
-    if (loadSession() && sessionId) {
-        log('📂 Sesiune găsită, încerc reconectare...');
-        try {
-            const test = await axios.get(`${INSTAGRAM_API}/direct_v2/inbox/`, {
-                headers: {
-                    ...getHeaders(),
-                    'X-CSRFToken': csrfToken,
-                    'Cookie': `csrftoken=${csrfToken}; sessionid=${sessionId}`
-                },
-                timeout: 10000
-            });
-            if (test.data.status === 'ok') {
-                log(`✅ Reconectat ca: ${username}`);
-                return true;
-            }
-        } catch {}
-        log('⚠️ Sesiunea a expirat, reconectare...');
+async function warmup() {
+  const res = await request('GET', `${WEB}/accounts/login/`, {
+    headers: { Accept: 'text/html,application/xhtml+xml' },
+  });
+  if (!state.cookies.csrftoken && typeof res.data === 'string') {
+    const m = res.data.match(/"csrf_token"\s*:\s*"([^"]+)"/);
+    if (m) state.cookies.csrftoken = m[1];
+  }
+  if (!state.cookies.csrftoken) throw new Error('Nu am putut obține csrftoken de la Instagram');
+}
+
+function encPassword(password) {
+  const ts = Math.floor(Date.now() / 1000); // Instagram vrea SECUNDE, nu ms
+  return `#PWD_INSTAGRAM_BROWSER:0:${ts}:${password}`;
+}
+
+function applyLoginSuccess(body) {
+  state.userId = String(body.userId || state.cookies.ds_user_id || '');
+  state.loggedIn = true;
+  saveSession();
+}
+
+async function twoFactor(username, info) {
+  const identifier = info?.two_factor_identifier;
+  if (!identifier) throw new Error('Instagram cere 2FA dar nu a trimis identificatorul');
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const code = await ask(`🔐 Cod 2FA (din app / SMS) [încercarea ${attempt}/3]: `);
+    const res = await request('POST', `${API}/web/accounts/login/ajax/two_factor/`, {
+      form: {
+        username,
+        verificationCode: code.replace(/\s+/g, ''),
+        identifier,
+        verification_method: String(info.sms_two_factor_on ? 1 : 3),
+        queryParams: '{}',
+      },
+      headers: { Referer: `${WEB}/accounts/login/two_factor/` },
+    });
+    const body = res.data || {};
+    if (body.authenticated || state.cookies.sessionid) {
+      applyLoginSuccess(body);
+      return true;
     }
+    log(body.message || 'Cod incorect.', 'error');
+  }
+  return false;
+}
 
-    // Cere username
-    const rl1 = readline.createInterface({
-        input: process.stdin,
-        output: process.stdout
-    });
-
-    const usernameInput = await new Promise(resolve => {
-        rl1.question('📱 Username Instagram: ', resolve);
-    });
-    rl1.close();
-
-    // Cere parolă
-    const rl2 = readline.createInterface({
-        input: process.stdin,
-        output: process.stdout
-    });
-
-    // Folosește readline cu input ascuns
-    const passwordInput = await new Promise(resolve => {
-        // Pentru parolă ascunsă
-        const stdin = process.stdin;
-        const stdout = process.stdout;
-        
-        stdout.write('🔑 Parola Instagram (ascunsă): ');
-        
-        stdin.setRawMode(true);
-        stdin.resume();
-        stdin.setEncoding('utf8');
-        
-        let password = '';
-        
-        const onData = (chunk) => {
-            chunk = chunk.toString();
-            if (chunk === '\n' || chunk === '\r' || chunk === '\r\n') {
-                stdin.setRawMode(false);
-                stdin.pause();
-                stdin.removeListener('data', onData);
-                stdout.write('\n');
-                resolve(password);
-                return;
-            }
-            if (chunk === '\u0003') { // CTRL+C
-                process.exit();
-            }
-            if (chunk === '\u007F') { // Backspace
-                if (password.length > 0) {
-                    password = password.slice(0, -1);
-                    stdout.write('\b \b');
-                }
-                return;
-            }
-            password += chunk;
-            stdout.write('*');
-        };
-        
-        stdin.on('data', onData);
-    });
-
-    rl2.close();
-
-    username = usernameInput;
-    
-    // Salvează username-ul în config
-    log(`📱 Conectare ca: ${username}`);
-
-    try {
-        // Obține CSRF token
-        const resp1 = await axios.get('https://www.instagram.com/accounts/login/', {
-            headers: getHeaders(),
-            timeout: 15000
-        });
-        
-        const cookies = resp1.headers['set-cookie'] || [];
-        const csrfCookie = cookies.find(c => c.includes('csrftoken='));
-        if (csrfCookie) {
-            const match = csrfCookie.match(/csrftoken=([^;]+)/);
-            if (match) csrfToken = match[1];
-        }
-        
-        if (!csrfToken) {
-            const html = resp1.data;
-            const match = html.match(/csrf_token":"([^"]+)"/);
-            if (match) csrfToken = match[1];
-        }
-        
-        if (!csrfToken) throw new Error('Nu am putut obține CSRF token');
-        
-        // Login
-        const loginData = new URLSearchParams({
-            username: username,
-            enc_password: `#PWD_INSTAGRAM_BROWSER:0:${Date.now()}:${passwordInput}`,
-            queryParams: '{}',
-            optIntoOneTap: 'false'
-        });
-        
-        const loginResp = await axios.post(
-            `${INSTAGRAM_API}/web/accounts/login/ajax/`,
-            loginData.toString(),
-            {
-                headers: {
-                    ...getHeaders(),
-                    'X-CSRFToken': csrfToken,
-                    'Referer': 'https://www.instagram.com/accounts/login/'
-                },
-                withCredentials: true,
-                timeout: 15000
-            }
-        );
-        
-        const setCookies = loginResp.headers['set-cookie'] || [];
-        const sessionCookie = setCookies.find(c => c.includes('sessionid='));
-        if (sessionCookie) {
-            const match = sessionCookie.match(/sessionid=([^;]+)/);
-            if (match) sessionId = match[1];
-        }
-        
-        if (!sessionId) throw new Error('Login eșuat');
-        
-        const loginResult = loginResp.data;
-        if (loginResult.authenticated !== true) {
-            throw new Error(`Login eșuat: ${JSON.stringify(loginResult)}`);
-        }
-        
-        userId = loginResult.userId;
-        if (!userId) {
-            const userMatch = JSON.stringify(loginResult).match(/logged_in_user_id":"?([0-9]+)"?/);
-            if (userMatch) userId = userMatch[1];
-        }
-        
-        saveSession();
-        log(`✅ Conectat ca: ${username} (ID: ${userId})`);
+async function login() {
+  if (state.running) {
+    log('Oprește botul înainte (comanda: stop).', 'warn');
+    return false;
+  }
+  prompting = true;
+  stopCli();
+  try {
+    // 1) Încearcă sesiunea salvată
+    const saved = readSessionFile();
+    if (saved?.cookies?.sessionid) {
+      state.cookies = saved.cookies;
+      state.username = saved.username || '';
+      state.userId = saved.userId || saved.cookies.ds_user_id || null;
+      log('Sesiune salvată găsită, verific...');
+      if (await verifySession()) {
+        state.loggedIn = true;
+        log(`Reconectat ca @${state.username}`, 'success');
         return true;
-        
-    } catch (error) {
-        log(`Login eșuat: ${error.message}`, 'error');
-        return false;
+      }
+      log('Sesiunea a expirat. Fac login din nou.', 'warn');
+      state.cookies = {};
     }
+
+    // 2) Login nou
+    const username = await ask('📱 Username Instagram: ');
+    if (!username) { log('Username gol.', 'error'); return false; }
+    const password = await askHidden('🔑 Parola (ascunsă): ');
+    if (!password) { log('Parolă goală.', 'error'); return false; }
+
+    state.username = username;
+    await warmup();
+
+    const res = await request('POST', `${API}/web/accounts/login/ajax/`, {
+      form: {
+        username,
+        enc_password: encPassword(password),
+        queryParams: '{}',
+        optIntoOneTap: 'false',
+        trustedDeviceRecords: '{}',
+      },
+      headers: { Referer: `${WEB}/accounts/login/` },
+    });
+
+    const body = typeof res.data === 'object' && res.data ? res.data : {};
+
+    if (res.status === 429 || body.message === 'rate limited' || body.spam) {
+      log('Instagram te-a limitat temporar (prea multe încercări). Așteaptă 10-30 min.', 'error');
+      return false;
+    }
+    if (body.two_factor_required) {
+      log('Cont cu autentificare în 2 pași.', 'warn');
+      const ok = await twoFactor(username, body.two_factor_info || {});
+      if (ok) log(`Conectat ca @${state.username} (ID: ${state.userId})`, 'success');
+      else log('2FA eșuat.', 'error');
+      return ok;
+    }
+    if (body.checkpoint_url || body.message === 'checkpoint_required') {
+      log('Instagram cere confirmare de securitate. Deschide aplicația/website-ul, aprobă login-ul, apoi rulează din nou "login".', 'error');
+      return false;
+    }
+    if (body.user === false) {
+      log('Nu există acest username.', 'error');
+      return false;
+    }
+    if (body.authenticated === false) {
+      log('Parolă greșită.', 'error');
+      return false;
+    }
+    if (!body.authenticated || !state.cookies.sessionid) {
+      log(`Login eșuat (HTTP ${res.status}): ${body.message || 'răspuns neașteptat de la Instagram'}`, 'error');
+      return false;
+    }
+
+    applyLoginSuccess(body);
+    log(`Conectat ca @${state.username} (ID: ${state.userId})`, 'success');
+    return true;
+  } catch (e) {
+    log(`Login eșuat: ${e.message}`, 'error');
+    return false;
+  } finally {
+    prompting = false;
+    startCli();
+  }
 }
 
-// ===================== OBȚINE USER ID =====================
-async function getUserId(username) {
-    try {
-        const resp = await axios.get(
-            `${INSTAGRAM_API}/web/get_profile/?username=${username}`,
-            {
-                headers: {
-                    ...getHeaders(),
-                    'X-CSRFToken': csrfToken,
-                    'Cookie': `csrftoken=${csrfToken}; sessionid=${sessionId}`
-                },
-                timeout: 10000
-            }
-        );
-        if (resp.data.user && resp.data.user.pk) return resp.data.user.pk;
-        return null;
-    } catch {
-        return null;
+async function verifySession() {
+  try {
+    const res = await request('GET', `${API}/users/web_profile_info/?username=${encodeURIComponent(state.username)}`);
+    if (res.status === 200 && res.data?.data?.user) {
+      state.userId = String(res.data.data.user.id);
+      return true;
     }
+    const inbox = await request('GET', `${API}/direct_v2/inbox/?limit=1&thread_message_limit=1`);
+    return inbox.status === 200 && inbox.data?.status === 'ok';
+  } catch {
+    return false;
+  }
 }
 
-// ===================== TRIMITE MESAJ =====================
-async function sendMessage(userId, message) {
-    try {
-        const now = Date.now();
-        if (now - lastMessageTime < 3000) {
-            await sleep(3000 - (now - lastMessageTime));
-        }
-        
-        const payload = {
-            recipient_users: [[userId, '0']],
-            client_context: Date.now().toString(),
-            text: message
-        };
-        
-        const resp = await axios.post(
-            `${INSTAGRAM_API}/direct_v2/web/threads/send_text/`,
-            payload,
-            {
-                headers: {
-                    ...getHeaders(),
-                    'X-CSRFToken': csrfToken,
-                    'Cookie': `csrftoken=${csrfToken}; sessionid=${sessionId}`,
-                    'X-IG-Device-ID': `web-${Date.now()}`
-                },
-                timeout: 15000
-            }
-        );
-        
-        lastMessageTime = Date.now();
-        
-        if (resp.data && resp.data.status === 'ok') {
-            return true;
-        }
-        return false;
-    } catch (error) {
-        return false;
-    }
+// ===================== API HELPERS =====================
+async function getUserIdByUsername(uname) {
+  const clean = uname.replace(/^@/, '');
+  const res = await request('GET', `${API}/users/web_profile_info/?username=${encodeURIComponent(clean)}`);
+  const id = res.data?.data?.user?.id;
+  return id ? String(id) : null;
 }
 
-// ===================== SALVEAZĂ VIEW ONCE =====================
-async function saveViewOnce(imageUrl, sender) {
-    try {
-        const resp = await axios.get(imageUrl, { responseType: 'arraybuffer', timeout: 30000 });
-        const buffer = Buffer.from(resp.data);
-        const filename = `view_once_${Date.now()}_${sender}.jpg`;
-        const filepath = path.join(VIEW_ONCE_DIR, filename);
-        
-        fs.writeFileSync(filepath, buffer);
-        viewOnceImages.push({ filename, filepath, sender, timestamp: Date.now() });
-        log(`📸 View once salvat: ${filename}`, 'success');
-        return filepath;
-    } catch (error) {
-        log(`Eroare salvare: ${error.message}`, 'error');
-        return null;
-    }
+async function sendToThread(threadId, text) {
+  const wait = SEND_COOLDOWN_MS - (Date.now() - state.lastSendAt);
+  if (wait > 0) await sleep(wait);
+  state.lastSendAt = Date.now();
+
+  const res = await request('POST', `${API}/direct_v2/threads/broadcast/text/`, {
+    form: {
+      action: 'send_item',
+      thread_ids: `[${threadId}]`,
+      client_context: `${Date.now()}${Math.floor(Math.random() * 1000)}`,
+      text,
+    },
+    headers: { Referer: `${WEB}/direct/t/${threadId}/` },
+  });
+
+  if (res.status === 200 && res.data?.status === 'ok') return true;
+  log(`Trimitere eșuată (HTTP ${res.status}): ${res.data?.message || ''}`, 'error');
+  if (res.status === 401 || res.status === 403) {
+    state.loggedIn = false;
+    state.running = false;
+    log('Sesiune invalidă. Rulează "login" din nou.', 'error');
+  }
+  return false;
 }
 
-// ===================== MONITOR MESAJE =====================
-async function monitorMessages() {
-    try {
-        const resp = await axios.get(
-            `${INSTAGRAM_API}/direct_v2/inbox/`,
-            {
-                headers: {
-                    ...getHeaders(),
-                    'X-CSRFToken': csrfToken,
-                    'Cookie': `csrftoken=${csrfToken}; sessionid=${sessionId}`
-                },
-                timeout: 10000
-            }
-        );
-        
-        const threads = resp.data.inbox?.threads || [];
-        for (const thread of threads) {
-            const items = thread.items || [];
-            for (const item of items) {
-                // View once
-                if (item.item_type === 'media' && item.media && item.media.view_mode === 'once') {
-                    const url = item.media.image_versions2?.candidates?.[0]?.url;
-                    if (url) {
-                        const sender = thread.users?.[0]?.username || 'unknown';
-                        await saveViewOnce(url, sender);
-                    }
-                }
-                
-                // Verifică comenzi în DM (prefix $)
-                if (item.item_type === 'text') {
-                    const text = item.text || '';
-                    const sender = thread.users?.[0];
-                    
-                    // Comenzile funcționează doar în DM
-                    if (text.startsWith('$') && sender && sender.pk !== userId) {
-                        await handleCommandInDM(sender.pk, sender.username, text);
-                    }
-                }
-            }
-        }
-        return true;
-    } catch (error) {
-        log(`Eroare monitorizare: ${error.message}`, 'error');
-        return false;
-    }
-}
+// ===================== MONITORIZARE DM =====================
+async function pollInbox() {
+  const res = await request(
+    'GET',
+    `${API}/direct_v2/inbox/?persistentBadging=true&folder=0&limit=20&thread_message_limit=10`
+  );
 
-// ===================== MANEJEAZĂ COMENZI ÎN DM =====================
-async function handleCommandInDM(userId, username, text) {
-    const parts = text.slice(1).trim().split(/\s+/);
-    const cmd = parts[0]?.toLowerCase();
-    const args = parts.slice(1);
-    
-    log(`Comanda $${cmd} de la @${username}`);
-    
-    // ===== HELP =====
-    if (cmd === 'help' || cmd === 'list') {
-        const helpMsg = `🤖 **Bot Instagram - Comenzi**
+  if (res.status === 401 || res.status === 403) {
+    state.loggedIn = false;
+    state.running = false;
+    log('Sesiunea a expirat. Rulează "login".', 'error');
+    return;
+  }
+  if (res.status !== 200 || !res.data?.inbox) {
+    log(`Nu am putut citi inbox-ul (HTTP ${res.status})`, 'warn');
+    return;
+  }
 
-**📌 Comenzi de bază:**
-\`$help\` - Afișează acest mesaj
-\`$status\` - Status bot
-\`$ping\` - Ping
+  const threads = res.data.inbox.threads || [];
+  for (const thread of threads) {
+    const threadId = thread.thread_id;
+    // items vin de la cel mai nou la cel mai vechi
+    const items = [...(thread.items || [])].reverse();
 
-**💬 Reply:**
-\`$reply [user]\` - Adaugă user la reply
-\`$stopreply\` - Oprește reply
+    for (const item of items) {
+      const id = String(item.item_id || `${threadId}:${item.timestamp}`);
+      if (state.seenItems.has(id)) continue;
+      state.seenItems.add(id);
 
-**📨 Spam:**
-\`$spam [user] [text]\` - Spam către user
-\`$stopspam\` - Oprește spam
-\`$spamdelay [sec]\` - Delay spam (1-60s)
+      // ignoră tot ce a fost trimis înainte de pornirea botului
+      const tsSec = Number(item.timestamp || 0) / 1e6;
+      if (tsSec && tsSec < state.startedAt) continue;
 
-**🎭 Mock & Copy:**
-\`$mock [user]\` - Alternanță caps
-\`$stopmock [user]\` - Oprește mock
-\`$copymsg [user]\` - Copiază mesaje
-\`$stopcopy [user]\` - Oprește copy
+      const senderId = String(item.user_id || '');
+      if (!senderId || senderId === String(state.userId)) continue; // nu răspunde la tine
+      if (item.item_type !== 'text') continue;
 
-**🔄 Altele:**
-\`$afk [motiv]\` - AFK mode
-\`$reverse\` - Inversează text
-\`$vvlist\` - Listă view once
-\`$target [user]\` - Setează țintă`;
+      const text = String(item.text || '');
+      const senderName =
+        (thread.users || []).find((u) => String(u.pk) === senderId)?.username || 'unknown';
 
-        await sendMessage(userId, helpMsg);
-        return;
-    }
-    
-    // ===== STATUS =====
-    if (cmd === 'status') {
-        const msg = `**Status Bot**
-📱 User: ${username}
-🟢 Rulare: ${running ? 'Da' : 'Nu'}
-🎯 Targete reply: ${replyState.targets.length}
-📸 View once: ${viewOnceImages.length}
-${spamState.running ? `📨 Spam: Activ (${spamState.delay}s)` : '📨 Spam: Inactiv'}`;
-        await sendMessage(userId, msg);
-        return;
-    }
-    
-    // ===== PING =====
-    if (cmd === 'ping') {
-        const start = Date.now();
-        await sendMessage(userId, '🏓 Pong!');
-        return;
-    }
-    
-    // ===== REPLY =====
-    if (cmd === 'reply') {
-        if (!args.length) {
-            await sendMessage(userId, '❌ Folosește: `$reply [username]`');
-            return;
-        }
-        const targetUser = args[0];
-        const targetId = await getUserId(targetUser);
-        if (!targetId) {
-            await sendMessage(userId, `❌ User @${targetUser} negăsit`);
-            return;
-        }
-        if (replyState.targets.includes(targetId)) {
-            await sendMessage(userId, `⚠️ @${targetUser} deja în listă`);
-            return;
-        }
-        replyState.running = true;
-        replyState.targets.push(targetId);
-        await sendMessage(userId, `✅ Reply activat pentru @${targetUser} (${replyState.targets.length} targete)`);
-        return;
-    }
-    
-    // ===== STOPREPLY =====
-    if (cmd === 'stopreply') {
-        replyState.running = false;
-        replyState.targets = [];
-        replyState.lastReplyTime = {};
-        await sendMessage(userId, '✅ Reply oprit pentru toți');
-        return;
-    }
-    
-    // ===== SPAM =====
-    if (cmd === 'spam') {
-        if (args.length < 2) {
-            await sendMessage(userId, '❌ Folosește: `$spam [username] [text]`');
-            return;
-        }
-        const targetUser = args[0];
-        const text = args.slice(1).join(' ');
-        const targetId = await getUserId(targetUser);
-        if (!targetId) {
-            await sendMessage(userId, `❌ User @${targetUser} negăsit`);
-            return;
-        }
-        if (spamState.running) {
-            await sendMessage(userId, '⚠️ Spam deja activ. Oprește-l cu `$stopspam`');
-            return;
-        }
-        
-        spamState.running = true;
-        spamState.target = targetId;
-        spamState.phraseIndex = 0;
-        
-        if (spamState.interval) clearInterval(spamState.interval);
-        spamState.interval = setInterval(async () => {
-            if (!spamState.running) { clearInterval(spamState.interval); return; }
-            await sendMessage(spamState.target, text);
-        }, spamState.delay * 1000);
-        
-        await sendMessage(userId, `✅ Spam pornit către @${targetUser} (delay: ${spamState.delay}s)`);
-        return;
-    }
-    
-    // ===== STOPSPAM =====
-    if (cmd === 'stopspam') {
-        if (!spamState.running) {
-            await sendMessage(userId, '⚠️ Spam inactiv');
-            return;
-        }
-        spamState.running = false;
-        if (spamState.interval) { clearInterval(spamState.interval); spamState.interval = null; }
-        spamState.target = null;
-        await sendMessage(userId, '✅ Spam oprit');
-        return;
-    }
-    
-    // ===== SPAMDELAY =====
-    if (cmd === 'spamdelay') {
-        if (!args.length) {
-            await sendMessage(userId, `Delay curent: ${spamState.delay}s`);
-            return;
-        }
-        const sec = parseInt(args[0]);
-        if (sec < 1 || sec > 60) {
-            await sendMessage(userId, '❌ 1-60 secunde');
-            return;
-        }
-        spamState.delay = sec;
-        await sendMessage(userId, `✅ Delay spam: ${sec}s`);
-        return;
-    }
-    
-    // ===== MOCK =====
-    if (cmd === 'mock') {
-        if (!args.length) {
-            await sendMessage(userId, '❌ Folosește: `$mock [username]`');
-            return;
-        }
-        const targetUser = args[0];
-        const targetId = await getUserId(targetUser);
-        if (!targetId) {
-            await sendMessage(userId, `❌ User @${targetUser} negăsit`);
-            return;
-        }
-        mockTargets[targetId] = true;
-        await sendMessage(userId, `✅ Mock activat pentru @${targetUser}`);
-        return;
-    }
-    
-    // ===== STOPMOCK =====
-    if (cmd === 'stopmock') {
-        if (!args.length) {
-            mockTargets = {};
-            await sendMessage(userId, '✅ Mock oprit pentru toți');
-            return;
-        }
-        const targetUser = args[0];
-        const targetId = await getUserId(targetUser);
-        if (targetId && mockTargets[targetId]) {
-            delete mockTargets[targetId];
-            await sendMessage(userId, `✅ Mock oprit pentru @${targetUser}`);
+      try {
+        if (text.startsWith('$')) {
+          await handleDmCommand({ threadId, senderId, senderName, text });
         } else {
-            await sendMessage(userId, `⚠️ @${targetUser} nu are mock activ`);
+          await handleAutoResponses({ threadId, senderId, senderName, text });
         }
-        return;
+      } catch (e) {
+        log(`Eroare la procesarea mesajului: ${e.message}`, 'error');
+      }
     }
-    
-    // ===== COPYMSG =====
-    if (cmd === 'copymsg') {
-        if (!args.length) {
-            await sendMessage(userId, '❌ Folosește: `$copymsg [username]`');
-            return;
-        }
-        const targetUser = args[0];
-        const targetId = await getUserId(targetUser);
-        if (!targetId) {
-            await sendMessage(userId, `❌ User @${targetUser} negăsit`);
-            return;
-        }
-        copyTargets[targetId] = true;
-        await sendMessage(userId, `✅ Copymsg activat pentru @${targetUser}`);
-        return;
+  }
+
+  // nu lăsăm setul să crească la infinit
+  if (state.seenItems.size > 5000) {
+    state.seenItems = new Set([...state.seenItems].slice(-2000));
+  }
+}
+
+async function handleAutoResponses({ threadId, senderId, senderName, text }) {
+  const last = state.lastReplyAt[threadId] || 0;
+  if (Date.now() - last < REPLY_COOLDOWN_MS) return;
+
+  let out = null;
+
+  if (state.mockTargets.has(senderId)) {
+    out = mockText(text);
+  } else if (state.replyTargets.has(senderId) && state.replyPhrases.length) {
+    out = state.replyPhrases[state.replyIndex % state.replyPhrases.length];
+    state.replyIndex++;
+  } else if (state.afk.active) {
+    out = `💤 Sunt AFK${state.afk.reason ? ` (${state.afk.reason})` : ''}. Revin mai târziu.`;
+  }
+
+  if (!out) return;
+  if (state.reverse) out = reverseText(out);
+
+  state.lastReplyAt[threadId] = Date.now();
+  await sendToThread(threadId, out);
+  log(`Răspuns automat către @${senderName}`);
+}
+
+// ===================== COMENZI DIN DM =====================
+const HELP_DM = `🤖 Comenzi bot (prefix $)
+
+• $help — acest mesaj
+• $status — starea botului
+• $ping — test răspuns
+• $afk [motiv] — pornește/oprește AFK
+• $reverse — inversează textul răspunsurilor
+• $reply @user — auto-reply cu fraze din reply.txt
+• $stopreply [@user] — oprește auto-reply
+• $mock @user — răspunde cu tExT aLtErNaT
+• $stopmock [@user] — oprește mock`;
+
+async function handleDmCommand({ threadId, senderId, senderName, text }) {
+  // Comenzile funcționează DOAR de la contul proprietarului
+  if (String(senderId) !== String(state.userId)) {
+    log(`Comandă ignorată de la @${senderName} (nu ești tu)`, 'warn');
+    return;
+  }
+
+  const parts = text.slice(1).trim().split(/\s+/);
+  const cmd = (parts[0] || '').toLowerCase();
+  const args = parts.slice(1);
+  const reply = (m) => sendToThread(threadId, m);
+
+  log(`Comandă $${cmd} de la @${senderName}`);
+
+  switch (cmd) {
+    case 'help':
+    case 'list':
+      return reply(HELP_DM);
+
+    case 'ping':
+      return reply('🏓 Pong!');
+
+    case 'status':
+      return reply(
+        `📊 Status\n` +
+          `• Cont: @${state.username}\n` +
+          `• Rulează: ${state.running ? 'da' : 'nu'}\n` +
+          `• AFK: ${state.afk.active ? `da${state.afk.reason ? ` (${state.afk.reason})` : ''}` : 'nu'}\n` +
+          `• Reverse: ${state.reverse ? 'da' : 'nu'}\n` +
+          `• Reply: ${state.replyTargets.size} ținte, ${state.replyPhrases.length} fraze\n` +
+          `• Mock: ${state.mockTargets.size} ținte`
+      );
+
+    case 'afk': {
+      state.afk.active = !state.afk.active;
+      state.afk.reason = state.afk.active ? args.join(' ') : '';
+      return reply(
+        `AFK ${state.afk.active ? '🟢 activat' : '🔴 dezactivat'}` +
+          (state.afk.reason ? ` (${state.afk.reason})` : '')
+      );
     }
-    
-    // ===== STOPCOPY =====
-    if (cmd === 'stopcopy') {
-        if (!args.length) {
-            copyTargets = {};
-            await sendMessage(userId, '✅ Copymsg oprit pentru toți');
-            return;
-        }
-        const targetUser = args[0];
-        const targetId = await getUserId(targetUser);
-        if (targetId && copyTargets[targetId]) {
-            delete copyTargets[targetId];
-            await sendMessage(userId, `✅ Copymsg oprit pentru @${targetUser}`);
-        } else {
-            await sendMessage(userId, `⚠️ @${targetUser} nu are copymsg activ`);
-        }
-        return;
+
+    case 'reverse':
+      state.reverse = !state.reverse;
+      return reply(`Reverse ${state.reverse ? '🟢 activat' : '🔴 dezactivat'}`);
+
+    case 'reply': {
+      if (!args.length) return reply('Folosește: $reply @username');
+      const uname = args[0].replace(/^@/, '');
+      const id = await getUserIdByUsername(uname);
+      if (!id) return reply(`❌ Nu am găsit @${uname}`);
+      if (loadReplyPhrases() === 0)
+        return reply('❌ Fișierul reply.txt e gol sau lipsește (o frază pe linie).');
+      state.replyTargets.set(id, uname);
+      return reply(`✅ Auto-reply pornit pentru @${uname} (${state.replyPhrases.length} fraze)`);
     }
-    
-    // ===== AFK =====
-    if (cmd === 'afk') {
-        afkState.active = !afkState.active;
-        afkState.reason = args.join(' ') || '';
-        const status = afkState.active ? '🟢 activat' : '🔴 dezactivat';
-        await sendMessage(userId, `AFK ${status}${afkState.reason ? ` (${afkState.reason})` : ''}`);
-        return;
+
+    case 'stopreply': {
+      if (!args.length) {
+        state.replyTargets.clear();
+        return reply('✅ Auto-reply oprit pentru toți');
+      }
+      const uname = args[0].replace(/^@/, '');
+      const id = await getUserIdByUsername(uname);
+      if (id && state.replyTargets.delete(id)) return reply(`✅ Auto-reply oprit pentru @${uname}`);
+      return reply(`⚠️ @${uname} nu era în listă`);
     }
-    
-    // ===== REVERSE =====
-    if (cmd === 'reverse') {
-        reverseMode = !reverseMode;
-        await sendMessage(userId, `Reverse ${reverseMode ? '🟢 activat' : '🔴 dezactivat'}`);
-        return;
+
+    case 'mock': {
+      if (!args.length) return reply('Folosește: $mock @username');
+      const uname = args[0].replace(/^@/, '');
+      const id = await getUserIdByUsername(uname);
+      if (!id) return reply(`❌ Nu am găsit @${uname}`);
+      state.mockTargets.set(id, uname);
+      return reply(`✅ Mock pornit pentru @${uname}`);
     }
-    
-    // ===== VVLIST =====
-    if (cmd === 'vvlist') {
-        if (!viewOnceImages.length) {
-            await sendMessage(userId, '📭 Nu există poze view once salvate');
-            return;
-        }
-        const list = viewOnceImages.map((v, i) => `${i+1}. ${v.filename} (de la @${v.sender})`).join('\n');
-        await sendMessage(userId, `📸 **Poze view once (${viewOnceImages.length}):**\n${list}`);
-        return;
+
+    case 'stopmock': {
+      if (!args.length) {
+        state.mockTargets.clear();
+        return reply('✅ Mock oprit pentru toți');
+      }
+      const uname = args[0].replace(/^@/, '');
+      const id = await getUserIdByUsername(uname);
+      if (id && state.mockTargets.delete(id)) return reply(`✅ Mock oprit pentru @${uname}`);
+      return reply(`⚠️ @${uname} nu era în listă`);
     }
-    
-    // ===== TARGET =====
-    if (cmd === 'target') {
-        if (!args.length) {
-            await sendMessage(userId, '❌ Folosește: `$target [username]`');
-            return;
-        }
-        const targetUser = args[0];
-        const targetId = await getUserId(targetUser);
-        if (!targetId) {
-            await sendMessage(userId, `❌ User @${targetUser} negăsit`);
-            return;
-        }
-        await sendMessage(userId, `✅ Țintă setată: @${targetUser} (ID: ${targetId})`);
-        return;
+
+    default:
+      return reply(`❌ Comandă necunoscută: $${cmd}\nScrie $help pentru listă.`);
+  }
+}
+
+// ===================== BUCLA BOTULUI =====================
+async function botLoop() {
+  while (state.running) {
+    try {
+      await pollInbox();
+    } catch (e) {
+      log(`Eroare în buclă: ${e.message}`, 'error');
     }
-    
-    // Comandă necunoscută
-    await sendMessage(userId, `❌ Comandă necunoscută: $${cmd}\nScrie \`$help\` pentru lista completă.`);
+    for (let i = 0; i < POLL_INTERVAL_MS / 500 && state.running; i++) await sleep(500);
+  }
+  log('Bucla s-a oprit.');
 }
 
 // ===================== COMENZI CONSOLĂ =====================
-const consoleCommands = {
-    start: async () => {
-        if (running) { log('Botul rulează deja!'); return; }
-        const loggedIn = await loginInteractive();
-        if (!loggedIn) { log('Login eșuat!', 'error'); return; }
-        running = true;
-        log('🚀 Bot pornit! Monitorizez DM-uri pentru comenzi...');
-        log('💡 Scrie "stop" pentru a opri.');
-        while (running) {
-            await monitorMessages();
-            await sleep(10000);
-        }
-    },
-    
-    stop: () => {
-        running = false;
-        if (spamState.interval) { clearInterval(spamState.interval); spamState.interval = null; }
-        log('🛑 Bot oprit.');
-    },
-    
-    status: () => {
-        console.log(`
-┌─────────────────────────────────┐
-│ STATUS BOT                      │
-├─────────────────────────────────┤
-│ Rulare: ${running ? '🟢 Da' : '🔴 Nu'}   │
-│ Utilizator: ${username || 'Necunoscut'}  │
-│ View once: ${viewOnceImages.length}      │
-│ Reply targete: ${replyState.targets.length} │
-│ Spam: ${spamState.running ? '🟢 Activ' : '🔴 Inactiv'}    │
-└─────────────────────────────────┘
-        `);
-    },
-    
-    help: () => {
-        console.log(`
-╔══════════════════════════════════════════════╗
-║     COMENZI CONSOLĂ                         ║
-╠══════════════════════════════════════════════╣
-║  start    - Pornește botul (cere login)    ║
-║  stop     - Oprește botul                  ║
-║  status   - Arată status                   ║
-║  help     - Acest mesaj                    ║
-║                                             ║
-║  COMENZI ÎN DM (cu prefix $):              ║
-║  $help    - Listă comenzi                 ║
-║  $status  - Status bot                    ║
-║  $reply [user] - Adaugă reply             ║
-║  $stopreply - Oprește reply               ║
-║  $spam [user] [text] - Spam               ║
-║  $stopspam - Oprește spam                 ║
-║  $mock [user] - Mock user                 ║
-║  $copymsg [user] - Copy user              ║
-║  $afk [motiv] - AFK                       ║
-║  $reverse - Reverse text                  ║
-║  $vvlist - Listă view once               ║
-╚══════════════════════════════════════════════╝
-        `);
+const HELP_CONSOLE = `
+╔════════════════════════════════════════════════╗
+║  INSTAGRAM BOT — comenzi consolă               ║
+╠════════════════════════════════════════════════╣
+║  login    conectare (sau reconectare)          ║
+║  start    pornește monitorizarea DM            ║
+║  stop     oprește monitorizarea                ║
+║  status   starea curentă                       ║
+║  whoami   contul conectat                      ║
+║  logout   șterge sesiunea salvată              ║
+║  help     acest mesaj                          ║
+║  exit     închide programul                    ║
+╚════════════════════════════════════════════════╝
+Comenzi în DM (doar de la contul tău): $help`;
+
+async function handleConsoleCommand(input) {
+  if (!input) return;
+  const cmd = input.toLowerCase();
+
+  switch (cmd) {
+    case 'login':
+      await login();
+      return;
+
+    case 'start': {
+      if (state.running) return log('Botul deja rulează.', 'warn');
+      if (!state.loggedIn) {
+        const ok = await login();
+        if (!ok) return;
+      }
+      loadReplyPhrases();
+      state.startedAt = Math.floor(Date.now() / 1000);
+      state.running = true;
+      log('🚀 Bot pornit. Monitorizez DM-urile. ("stop" ca să oprești)', 'success');
+      botLoop();
+      return;
     }
-};
 
-// ===================== CONSOLE CLI =====================
-const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-    terminal: false
-});
+    case 'stop':
+      if (!state.running) return log('Botul nu rulează.', 'warn');
+      state.running = false;
+      log('🛑 Opresc botul...');
+      return;
 
-rl.on('line', (line) => {
-    const cmd = line.trim().toLowerCase();
-    if (consoleCommands[cmd]) {
-        consoleCommands[cmd]();
-    } else if (cmd) {
-        console.log(`❌ Comandă necunoscută: "${cmd}". Scrie "help" pentru listă.`);
-    }
-});
+    case 'status':
+      console.log(
+        `\n  Conectat : ${state.loggedIn ? `da (@${state.username})` : 'nu'}\n` +
+          `  Rulează  : ${state.running ? 'da' : 'nu'}\n` +
+          `  AFK      : ${state.afk.active ? `da${state.afk.reason ? ` (${state.afk.reason})` : ''}` : 'nu'}\n` +
+          `  Reverse  : ${state.reverse ? 'da' : 'nu'}\n` +
+          `  Reply    : ${state.replyTargets.size} ținte (${state.replyPhrases.length} fraze)\n` +
+          `  Mock     : ${state.mockTargets.size} ținte\n`
+      );
+      return;
 
-// ===================== START =====================
-console.log(`
-╔══════════════════════════════════════════════╗
-║     INSTAGRAM BOT - LOGIN INTERACTIV        ║
-║                                              ║
-║  Scrie "start" în consolă pentru a începe  ║
-║  Botul te va întreba username și parola     ║
-║                                              ║
-║  Comenzi consolă: start, stop, status, help ║
-║  Comenzi DM: $help                          ║
-╚══════════════════════════════════════════════╝
-`);
+    case 'whoami':
+      return console.log(
+        state.loggedIn ? `  @${state.username} (ID: ${state.userId})\n` : '  Neconectat\n'
+      );
 
-console.log('💡 Scrie "start" pentru a porni botul.');
-console.log('💡 Scrie "help" pentru lista completă de comenzi.\n');
+    case 'logout':
+      state.running = false;
+      clearSession();
+      log('Sesiune ștearsă.', 'success');
+      return;
+
+    case 'help':
+    case '?':
+      return console.log(HELP_CONSOLE);
+
+    case 'exit':
+    case 'quit':
+      state.running = false;
+      log('Pa!');
+      process.exit(0);
+      return;
+
+    default:
+      console.log(`❌ Comandă necunoscută: "${input}". Scrie "help".`);
+  }
+}
+
+// ===================== PORNIRE =====================
+console.log(HELP_CONSOLE);
+if (readSessionFile()) console.log('💾 Există o sesiune salvată — scrie "start" sau "login".\n');
+else console.log('💡 Scrie "login" pentru a te conecta, apoi "start".\n');
+
+loadReplyPhrases();
+startCli();
 
 process.on('SIGINT', () => {
-    running = false;
-    if (spamState.interval) clearInterval(spamState.interval);
-    log('🛑 Oprește botul...');
-    setTimeout(() => process.exit(0), 1000);
+  state.running = false;
+  console.log('\n🛑 Închid...');
+  setTimeout(() => process.exit(0), 300);
 });
-
-process.on('uncaughtException', (err) => {
-    log(`Eroare: ${err.message}`, 'error');
-});
-
-process.on('unhandledRejection', (err) => {
-    log(`Eroare: ${err.message}`, 'error');
-});
+process.on('uncaughtException', (err) => log(`Eroare necapturată: ${err.message}`, 'error'));
+process.on('unhandledRejection', (err) =>
+  log(`Promisiune respinsă: ${err?.message || err}`, 'error')
+);
