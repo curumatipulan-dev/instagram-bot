@@ -836,23 +836,40 @@ async function handleAutoFeatures(threadId, senderId, senderName, text) {
 async function pollInbox() {
     if (!running) return;
     try {
-        const inbox = await ig.feed.directInbox().items();
+        // Creeaza un feed nou la fiecare verificare. Refolosirea feedului poate
+        // pastra cursorul vechi si poate face ca mesajele noi sa nu mai apara.
+        const inboxFeed = ig.feed.directInbox();
+        const inbox = await inboxFeed.items();
         for (const thread of inbox) {
-            const threadId = thread.thread_id;
+            const threadId = String(thread.thread_id || thread.thread_v2_id || '');
+            if (!threadId) continue;
             const items = (thread.items || []).slice().reverse(); // de la cel mai vechi la cel mai nou
             if (!threadCursor[threadId]) {
-                // prima vedere a threadului: marcam tot ca vazut, nu raspundem la mesaje vechi
+                // La prima verificare procesam comenzile recente. In versiunea
+                // veche toate mesajele existente erau ignorate, inclusiv $help
+                // trimis imediat dupa pornirea botului.
                 const newest = items.length ? Number(items[items.length - 1].timestamp) : Date.now() * 1000;
                 threadCursor[threadId] = newest;
-                items.forEach((it) => seenItems.add(it.item_id));
+                const recentLimit = Date.now() * 1000 - 5 * 60 * 1000 * 1000;
+                for (const item of items) {
+                    const itemId = String(item.item_id || item.client_context || '');
+                    if (itemId) seenItems.add(itemId);
+                    const text = typeof item.text === 'string' ? item.text.trim() : '';
+                    if (!text.startsWith(PREFIX) || Number(item.timestamp || 0) < recentLimit) continue;
+                    const senderId = String(item.user_id || myUserId || '');
+                    const user = (thread.users || []).find((u) => String(u.pk) === senderId);
+                    const senderName = user ? user.username : (senderId === myUserId ? USERNAME : 'necunoscut');
+                    log(`Comanda recenta de la @${senderName}: ${text}`);
+                    await handleCommand(threadId, senderId, senderName, text);
+                }
                 continue;
             }
 
             for (const item of items) {
-                if (seenItems.has(item.item_id)) continue;
-                if (Number(item.timestamp) <= threadCursor[threadId]) { seenItems.add(item.item_id); continue; }
-                seenItems.add(item.item_id);
-                threadCursor[threadId] = Math.max(threadCursor[threadId], Number(item.timestamp));
+                const itemId = String(item.item_id || item.client_context || '');
+                if (itemId && seenItems.has(itemId)) continue;
+                if (itemId) seenItems.add(itemId);
+                threadCursor[threadId] = Math.max(threadCursor[threadId], Number(item.timestamp || 0));
 
                 const senderId = String(item.user_id);
                 const user = (thread.users || []).find((u) => String(u.pk) === senderId);
@@ -866,7 +883,9 @@ async function pollInbox() {
                     continue;
                 }
 
-                if (item.item_type !== 'text') continue;
+                // Unele raspunsuri Instagram nu mai trimit item_type="text",
+                // dar campul text este prezent si valid.
+                if (typeof item.text !== 'string') continue;
                 const text = String(item.text || '');
 
                 // comenzi: accepta si mesajele trimise de contul tau, in orice chat
