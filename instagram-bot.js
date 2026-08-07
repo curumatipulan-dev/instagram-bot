@@ -41,6 +41,8 @@ let pollTimer = null;
 let lastSendTime = 0;
 let pollBackoff = 0;      // pauza curenta impusa de erori (ms)
 let pollErrors = 0;       // erori consecutive la citirea inboxului
+let cli = null;           // interfata de comenzi din consola
+let inputBusy = false;    // true cat timp cerem username/parola/cod (consola nu mai citeste comenzi)
 const startTime = Date.now();
 
 // ===================== STARI =====================
@@ -172,10 +174,17 @@ function loadPhrases(file) {
 }
 
 function ask(question, hidden) {
+    // Cat timp intrebam ceva, oprim ascultatorul de comenzi din consola.
+    // Altfel el citeste acelasi rand si raspunde "Comanda necunoscuta",
+    // iar username-ul/parola ajung in consola in loc sa ajunga la login.
+    inputBusy = true;
+    const done = (value, resolve) => { inputBusy = false; if (cli) cli.resume(); resolve(value); };
+    if (cli) cli.pause();
+
     return new Promise((resolve) => {
         if (!hidden) {
             const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-            rl.question(question, (answer) => { rl.close(); resolve(answer.trim()); });
+            rl.question(question, (answer) => { rl.close(); done(answer.trim(), resolve); });
             return;
         }
         process.stdout.write(question);
@@ -191,7 +200,7 @@ function ask(question, hidden) {
                 stdin.pause();
                 stdin.removeListener('data', onData);
                 process.stdout.write('\n');
-                resolve(value.trim());
+                done(value.trim(), resolve);
                 return;
             }
             if (chunk === '\u0003') { process.exit(0); }
@@ -239,6 +248,15 @@ async function tryRestoreSession() {
 
 // ===================== LOGIN =====================
 
+// Instagram nu trimite mereu IgCheckpointError: uneori raspunsul e un 400/467
+// obisnuit cu message="checkpoint_required" in body. Le tratam la fel.
+function isCheckpoint(err) {
+    if (err instanceof IgCheckpointError) return true;
+    const body = err && err.response && err.response.body;
+    if (body && (body.message === 'checkpoint_required' || body.checkpoint_url)) return true;
+    return /checkpoint_required|challenge_required/i.test(String(err && err.message));
+}
+
 async function login() {
     if (await tryRestoreSession()) {
         loggedIn = true;
@@ -282,7 +300,7 @@ async function login() {
                 log(`Cod 2FA respins: ${e2.message}`, 'error');
                 return false;
             }
-        } else if (err instanceof IgCheckpointError) {
+        } else if (isCheckpoint(err)) {
             log('Instagram cere verificare de securitate (checkpoint).', 'warn');
             try {
                 await ig.challenge.auto(true);
@@ -292,7 +310,8 @@ async function login() {
                 await ig.challenge.sendSecurityCode(code);
                 user = await ig.account.currentUser();
             } catch (e3) {
-                log(`Verificarea a esuat: ${e3.message}. Deschide aplicatia Instagram, aproba logarea, apoi reincearca.`, 'error');
+                log(`Verificarea a esuat: ${e3.message}`, 'error');
+                log('Deschide aplicatia Instagram pe telefon, aproba cererea de logare / confirma ca esti tu, asteapta 10-15 minute, apoi scrie "start" din nou.', 'warn');
                 return false;
             }
         } else {
@@ -1011,8 +1030,9 @@ const consoleCommands = {
     exit: () => { stop(); process.exit(0); },
 };
 
-const cli = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
+cli = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
 cli.on('line', (line) => {
+    if (inputBusy) return; // randul apartine unei intrebari de login
     const cmd = line.trim().toLowerCase();
     if (!cmd) return;
     if (consoleCommands[cmd]) consoleCommands[cmd]();
