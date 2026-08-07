@@ -1,72 +1,79 @@
-# Instagram Bot
+# Instagram Bot pentru Termux
 
-Bot Node.js care se conectează la contul tău de Instagram și răspunde la comenzi trimise prin DM.
+Bot de Instagram care ruleaza in Termux si se comanda direct din DM-uri, cu prefixul `$`.
+Raspunsul botului vine mereu in acelasi chat in care ai scris comanda.
 
-## Instalare
+## Instalare in Termux
 
 ```bash
+pkg update && pkg upgrade -y
+pkg install nodejs-lts git -y
+git clone https://github.com/curumatipulan-dev/instagram-bot
+cd instagram-bot
 npm install
-npm start
+node instagram-bot.js
 ```
 
-Ai nevoie de **Node.js 18+**.
+In consola scrii `start`, apoi introduci username-ul si parola. Daca ai 2FA, botul iti cere codul.
+Sesiunea se salveaza in `session.json`, deci la urmatoarele porniri nu mai ceri login.
 
-## Comenzi în consolă
+Ca sa porneasca direct, fara sa scrii `start`:
 
-| Comandă  | Ce face |
-|----------|---------|
-| `login`  | Conectare la Instagram (username + parolă, suportă 2FA) |
-| `start`  | Pornește monitorizarea DM-urilor (face login dacă e nevoie) |
-| `stop`   | Oprește monitorizarea |
-| `status` | Starea curentă |
-| `whoami` | Contul conectat |
-| `logout` | Șterge sesiunea salvată |
-| `help`   | Lista comenzilor |
-| `exit`   | Închide programul |
-
-## Comenzi în DM (prefix `$`)
-
-Funcționează **doar de la contul tău** (trimise din propriul cont), ca să nu poată altcineva controla botul.
-
-| Comandă | Ce face |
-|---------|---------|
-| `$help` | Lista comenzilor |
-| `$status` | Starea botului |
-| `$ping` | Test răspuns |
-| `$afk [motiv]` | Pornește/oprește răspunsul automat AFK |
-| `$reverse` | Inversează textul răspunsurilor |
-| `$reply @user` | Auto-reply cu fraze din `reply.txt` |
-| `$stopreply [@user]` | Oprește auto-reply |
-| `$mock @user` | Răspunde cu `tExT aLtErNaT` |
-| `$stopmock [@user]` | Oprește mock |
-
-## `reply.txt`
-
-Fișier opțional, o frază pe linie. Botul le folosește pe rând la `$reply`.
-
-```
-salut
-ce faci?
-mai vorbim
+```bash
+node instagram-bot.js --auto
 ```
 
-## Fișiere generate
+## Comenzi consola
 
-- `session.json` — cookie-urile sesiunii (nu îl urca pe GitHub, e în `.gitignore`)
+| Comanda | Descriere |
+| --- | --- |
+| `start` | Porneste botul |
+| `stop` | Opreste botul |
+| `status` | Starea botului |
+| `logout` | Sterge sesiunea salvata |
+| `help` | Lista comenzilor din consola |
+| `exit` | Inchide programul |
 
-## Ce s-a reparat față de v1
+## Comenzi DM (prefix `$`)
 
-- **Login-ul nu se mai suprapune peste consolă** — v1 avea două interfețe `readline` active în paralel, așa că username-ul tău era interpretat ca o comandă („comandă necunoscută”) iar promptul se amesteca cu `help`. Acum există un singur input activ la un moment dat.
-- **Endpoint corect de login** (`www.instagram.com/api/v1/...` în loc de `i.instagram.com`) și timestamp în secunde la `enc_password` — v1 nu se putea autentifica deloc.
-- **Cookie jar real** — `csrftoken`, `sessionid`, `ds_user_id`, `mid` sunt păstrate și trimise la fiecare cerere.
-- **Suport 2FA** și mesaje clare pentru checkpoint / rate-limit / parolă greșită, în loc de „Login eșuat”.
-- **Fără mesaje repetate** — v1 reprocesa tot inbox-ul la fiecare 10 secunde, deci retrimitea `$help` la nesfârșit. Acum fiecare mesaj se procesează o singură dată.
-- **Crash-uri reparate** — `$stopmock` / `$stopcopy` fără argument aruncau `TypeError` (atribuire la `const`).
-- **Trimiterea mesajelor funcționează** — endpoint `broadcast/text` cu form-urlencoded, plus rate limiting între mesaje.
-- **Comenzile sunt restricționate la contul tău**, ca să nu ți-l poată controla oricine îți scrie `$spam`.
+Scrie `$help` in orice conversatie si primesti lista completa in acel chat.
 
-## Notă
+Baza: `$help`, `$ping`, `$status`, `$uptime`
 
-Funcțiile de spam în masă și de salvare a pozelor „view once” din v1 au fost scoase intenționat: prima e folosită pentru hărțuire și îți duce contul la ban, a doua salvează conținut privat pe care expeditorul l-a trimis ca să dispară. Restul funcțiilor sunt intacte.
+Reply automat: `$reply [user]`, `$stopreply [user]`, `$replydelay [sec]`, `$replylist`
 
-⚠️ Automatizarea contului încalcă Termenii Instagram și poate duce la limitări sau suspendarea contului. Folosește pe propriul risc, pe contul tău.
+Spam: `$spam [user] [text]`, `$stopspam`, `$spamdelay [sec]`
+
+Mock si copy: `$mock [user]`, `$stopmock [user]`, `$copymsg [user]`, `$stopcopy [user]`
+
+Imagini: `$vvlist`, `$vvclear`
+
+Altele: `$afk [motiv]`, `$stopafk`, `$reverse`, `$stopreverse`, `$autolike [user]`,
+`$stopautolike [user]`, `$mention [user]`, `$stopmention`, `$target [user]`, `$untarget`,
+`$listtargets`, `$clearall`
+
+Fraze: `$addnotepad`, `$addreply`, `$addbeef`, `$listphrases`
+
+## Fisiere cu fraze
+
+Pune in folderul botului, o fraza pe linie:
+
+- `spam.txt` - frazele folosite de `$spam`
+- `reply.txt` - frazele folosite de reply automat
+- `beef.txt` - fraze suplimentare
+
+## Ce s-a reparat fata de versiunea veche
+
+- Loginul folosea endpointuri web nesustinute si `axios`, care nici macar nu era in `package.json`.
+  Acum se foloseste `instagram-private-api`, cu suport real pentru 2FA si checkpoint.
+- Sesiunea se salveaza complet (device + cookies), nu doar `sessionid`, deci reconectarea merge.
+- Mesajele se trimiteau ca JSON cu antet `x-www-form-urlencoded`, deci esuau. Acum se trimit corect.
+- Raspunsul la comenzi pleca intr-o conversatie noua. Acum merge in threadul din care vine comanda.
+- Comenzile date de pe contul tau erau ignorate. Acum `$help` scris de tine functioneaza.
+- Botul reprocesa mesajele vechi la fiecare ciclu. Acum tine evidenta mesajelor deja tratate.
+- Toate emoji-urile au fost scoase din script si din output.
+
+## Nota
+
+Automatizarea Instagram poate duce la limitari sau blocarea contului.
+Foloseste delay-uri mari si un cont pe care iti permiti sa il pierzi.
