@@ -1,1242 +1,806 @@
-/*
- * INSTAGRAM BOT - versiune curata pentru Termux
- *
- * Instalare in Termux:
- *   pkg update && pkg upgrade -y
- *   pkg install nodejs-lts git -y
- *   git clone https://github.com/curumatipulan-dev/instagram-bot
- *   cd instagram-bot
- *   npm install
- *   node instagram-bot.js
- *
- * Comenzile din DM se scriu cu prefix $ (ex: $help).
- * Raspunsul botului vine in exact acelasi chat in care ai scris comanda.
- */
-
+#!/usr/bin/env node
 'use strict';
 
 const fs = require('fs');
 const path = require('path');
-const readline = require('readline');
-const crypto = require('crypto');
-const { IgApiClient, IgLoginTwoFactorRequiredError, IgCheckpointError } = require('instagram-private-api');
+const readlineSync = require('readline-sync');
+const {
+  IgApiClient,
+  IgLoginTwoFactorRequiredError,
+  IgCheckpointError,
+} = require('instagram-private-api');
 
-// ===================== CONFIG =====================
+const SESSION_FILE = path.join(__dirname, 'session.json');
+const DATA_DIR = path.join(__dirname, 'data');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-// ---- .env, fara dependinte externe (util pe VPS / hosting) ----
-function loadEnvFile() {
-    const file = path.join(__dirname, '.env');
-    if (!fs.existsSync(file)) return;
-    for (const raw of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
-        const line = raw.trim();
-        if (!line || line.startsWith('#')) continue;
-        const eq = line.indexOf('=');
-        if (eq === -1) continue;
-        const key = line.slice(0, eq).trim();
-        let value = line.slice(eq + 1).trim();
-        if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-            value = value.slice(1, -1);
-        }
-        if (!(key in process.env)) process.env[key] = value;
-    }
-}
-loadEnvFile();
+const SPAM_NOTES_FILE = path.join(DATA_DIR, 'spam_notepad.txt');
+const REPLY_NOTES_FILE = path.join(DATA_DIR, 'reply_notepad.txt');
+const BEEF_NOTES_FILE = path.join(DATA_DIR, 'beef_notepad.txt');
+const GROUP_NOTES_FILE = path.join(DATA_DIR, 'group_notepad.txt');
 
-const ARGS = process.argv.slice(2);
-const hasFlag = (name) => ARGS.includes(name);
-const envBool = (v) => /^(1|true|yes|da|on)$/i.test(String(v || ''));
-
-// Unde se scriu sesiunea, notitele si imaginile. Pe VPS poti monta un volum.
-const DATA_DIR = process.env.IG_DATA_DIR ? path.resolve(process.env.IG_DATA_DIR) : __dirname;
-try { if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
-
-// Headless = fara terminal interactiv (pm2, systemd, docker, nohup).
-// In acest mod datele de login vin din variabile de mediu / .env.
-const HEADLESS = hasFlag('--headless')
-    ? true
-    : process.env.IG_HEADLESS !== undefined
-        ? envBool(process.env.IG_HEADLESS)
-        : !process.stdin.isTTY;
-const AUTO_START = hasFlag('--auto')
-    ? true
-    : process.env.IG_AUTO_START !== undefined
-        ? envBool(process.env.IG_AUTO_START)
-        : HEADLESS;
-
-const SESSION_FILE = path.join(DATA_DIR, 'session.json');
-const NOTEPAD_FILE = path.join(DATA_DIR, 'notepad.json');
-const PREFIX = '$';
-const POLL_INTERVAL_MS = 20000;  // cat de des verifica inboxul (Instagram da 467 daca ceri prea des)
-const POLL_JITTER_MS = 8000;     // variatie aleatoare, ca sa nu para trafic de bot
-const MAX_BACKOFF_MS = 15 * 60 * 1000; // pauza maxima dupa erori repetate
-const MIN_SEND_GAP_MS = 2500;    // pauza minima intre 2 mesaje trimise
-const LIKE_EMOJI = '\u2764\ufe0f'; // reactia "inima" ceruta de API
+const SCRIPT_NAME = 'Finesse Instagram';
+const PREFIXES = ['$', '=', '!'];
+const POLL_MS = 6000;
 
 const ig = new IgApiClient();
 
-let USERNAME = '';
-let myUserId = null;
-let running = false;
-let loggedIn = false;
-let pollTimer = null;
-let lastSendTime = 0;
-let pollBackoff = 0;      // pauza curenta impusa de erori (ms)
-let pollErrors = 0;       // erori consecutive la citirea inboxului
-let cli = null;           // interfata de comenzi din consola
-let inputBusy = false;
-let loginInProgress = false;  // true cat timp se face login (comenzile din terminal asteapta)    // true cat timp cerem username/parola/cod (consola nu mai citeste comenzi)
-const startTime = Date.now();
+const state = {
+  connected: false,
+  running: false,
+  username: '',
+  userId: '',
+  startedAt: Date.now(),
+  bootTime: Date.now(),
+  seen: new Set(),
 
-// ===================== STARI =====================
+  afk: false,
+  afkReason: '',
+  reverse: false,
+  antitrap: false,
+  autoseen: true,
 
-const replyState = { running: false, targets: [], lastReplyTime: {}, lineIndex: 0 };
-const spamState = { running: false, target: null, targetName: '', text: '', timer: null, phraseIndex: 0 };
-const mockTargets = {};
-const mockLastTime = {};
-const copyTargets = {};
-const copyLastTime = {};
-const autolikeTargets = {};
-const afkState = { active: false, reason: '', notified: {} };
+  replyTargets: new Set(),      // auto-răspuns cu linii din notepad
+  customReply: {},              // userId -> text fix
+  mockTargets: new Set(),       // rescrie aLtErNaTiNg
+  copyTargets: new Set(),       // repetă mesajul
+  reactTargets: {},             // userId -> emoji
+  mentionTarget: null,
 
-let reverseMode = false;
-let mentionTargetId = null;
-let mentionTargetName = '';
-let manualTargetId = null;
-let manualTargetName = '';
+  replyDelay: 2000,
+  lastReply: {},
 
-let replyDelay = 7;
-let spamDelay = 4;
+  spam: { running: false, threadId: '', text: '', delay: 3000, left: 0 },
+  repeat: { running: false, threadId: '', text: '', delay: 5000 },
+  typing: new Map(),            // threadId -> interval
 
-let spamPhrases = [];
-let replyWords = [];
-let beefPhrases = [];
-
-const savedImages = [];
-const seenItems = new Set();      // id-uri de mesaje deja procesate
-const threadCursor = {};          // thread_id -> timestamp ultimului mesaj procesat
-let notepad = { notes: {} };      // user_id -> lista note personale
-
-// ===================== UTILS =====================
+  snipe: {},                    // threadId -> ultimul mesaj sters/primit
+  lastMsg: {},                  // threadId -> ultim mesaj
+  threadNames: {},              // threadId -> nume prietenos
+};
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function log(msg, type) {
-    const tag = type === 'error' ? '[EROARE]' : type === 'ok' ? '[OK]' : type === 'warn' ? '[ATENTIE]' : '[INFO]';
-    console.log(`${tag} ${new Date().toLocaleTimeString()} - ${msg}`);
+function log(message, type = 'info') {
+  const icons = { info: '•', ok: '✓', warn: '!', error: '×' };
+  console.log(`[${new Date().toLocaleTimeString()}] ${icons[type] || '•'} ${message}`);
 }
 
 function uptime() {
-    const s = Math.floor((Date.now() - startTime) / 1000);
-    const d = Math.floor(s / 86400);
-    const h = Math.floor((s % 86400) / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    return `${d}z ${h}h ${m}m ${s % 60}s`;
+  const s = Math.floor((Date.now() - state.bootTime) / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return `${h}h ${m}m ${s % 60}s`;
+}
+
+function loadLines(file) {
+  try {
+    return fs.readFileSync(file, 'utf8').split(/\n/).map((l) => l.trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function appendLine(file, line) {
+  fs.appendFileSync(file, `${line}\n`, 'utf8');
+}
+
+function pick(list, fallback) {
+  if (!list.length) return fallback;
+  return list[Math.floor(Math.random() * list.length)];
 }
 
 function mockText(text) {
-    return text.split('').map((c, i) => (i % 2 === 0 ? c.toLowerCase() : c.toUpperCase())).join('');
+  return [...text].map((c, i) => (i % 2 ? c.toUpperCase() : c.toLowerCase())).join('');
 }
 
-function reverseText(text) {
-    return text.split('').reverse().join('');
+/* ─────────────── SESIUNE / LOGIN ─────────────── */
+
+function saveSession() {
+  const session = ig.state.serialize();
+  delete session.constants;
+  fs.writeFileSync(
+    SESSION_FILE,
+    JSON.stringify({ username: state.username, session }, null, 2),
+    { mode: 0o600 }
+  );
 }
 
-// ===================== NOTEPAD =====================
+function deleteSession() {
+  if (fs.existsSync(SESSION_FILE)) fs.unlinkSync(SESSION_FILE);
+  state.connected = false;
+  state.running = false;
+  state.username = '';
+  state.userId = '';
+}
 
-function loadNotepad() {
-    if (!fs.existsSync(NOTEPAD_FILE)) return { notes: {} };
+async function restoreSession() {
+  if (!fs.existsSync(SESSION_FILE)) return false;
+  try {
+    const saved = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8'));
+    if (!saved.username || !saved.session) return false;
+    state.username = saved.username;
+    ig.state.generateDevice(state.username);
+    await ig.state.deserialize(saved.session);
+    const account = await ig.account.currentUser();
+    state.userId = String(account.pk);
+    state.connected = true;
+    log(`Sesiune restaurată: @${account.username}`, 'ok');
+    return true;
+  } catch {
+    log('Sesiunea salvată a expirat; este necesar un login nou.', 'warn');
+    deleteSession();
+    return false;
+  }
+}
+
+async function completeTwoFactor(username, error) {
+  const info = error.response?.body?.two_factor_info;
+  if (!info?.two_factor_identifier) throw new Error('Instagram nu a trimis datele pentru 2FA.');
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const code = readlineSync.question(`Cod 2FA (${attempt}/3): `).replace(/\s/g, '');
     try {
-        const data = JSON.parse(fs.readFileSync(NOTEPAD_FILE, 'utf8'));
-        if (data && typeof data.notes === 'object') return data;
-        return { notes: {} };
-    } catch {
-        return { notes: {} };
+      return await ig.account.twoFactorLogin({
+        username,
+        verificationCode: code,
+        twoFactorIdentifier: info.two_factor_identifier,
+        verificationMethod: info.totp_two_factor_on ? '0' : '1',
+        trustThisDevice: '1',
+      });
+    } catch (twoFactorError) {
+      if (attempt === 3) throw twoFactorError;
+      log('Cod incorect. Încearcă din nou.', 'error');
     }
+  }
+  return null;
 }
 
-function saveNotepad() {
-    try {
-        fs.writeFileSync(NOTEPAD_FILE, JSON.stringify(notepad, null, 2));
-    } catch (e) {
-        log(`Nu am putut salva notepad: ${e.message}`, 'warn');
-    }
-}
-
-function notepadHelp() {
-    return [
-        'NOTEPAD - comenzi',
-        '$note add [text] - adauga o notita',
-        '$note list - arata toate notitele tale',
-        '$note delete [numar] - sterge notita cu numarul respectiv',
-        '$note clear - sterge toate notitele',
-        '$note help - ajutor notepad',
-    ].join('\n');
-}
-
-function notepadList(userId) {
-    const list = notepad.notes[userId] || [];
-    if (!list.length) return 'Notepadul tau este gol.';
-    return ['Notitele tale:', ...list.map((n, i) => `${i + 1}. ${n.text}`)].join('\n');
-}
-
-function notepadAdd(userId, text) {
-    if (!text.trim()) return 'Textul notei este gol.';
-    if (!notepad.notes[userId]) notepad.notes[userId] = [];
-    notepad.notes[userId].push({ text: text.trim(), createdAt: Date.now() });
-    saveNotepad();
-    return `Notita adaugata. Ai ${notepad.notes[userId].length} notite.`;
-}
-
-function notepadDelete(userId, index) {
-    const list = notepad.notes[userId] || [];
-    if (index < 1 || index > list.length) return `Numar invalid. Ai ${list.length} notite.`;
-    const removed = list.splice(index - 1, 1);
-    if (!list.length) delete notepad.notes[userId];
-    saveNotepad();
-    return `Notita stearsa: ${removed[0].text}`;
-}
-
-function notepadClear(userId) {
-    delete notepad.notes[userId];
-    saveNotepad();
-    return 'Toate notitele tale au fost sterse.';
-}
-
-notepad = loadNotepad();
-
-// ===================== FRAZE =====================
-
-function phraseFile(file) {
-    const inData = path.join(DATA_DIR, file);
-    return fs.existsSync(inData) ? inData : path.join(__dirname, file);
-}
-
-function loadPhrases(file) {
-    try {
-        return fs.readFileSync(phraseFile(file), 'utf8')
-            .split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-    } catch {
-        return [];
-    }
-}
-
-function ask(question, hidden) {
-    if (HEADLESS) {
-        log(`Nu pot cere interactiv "${question.trim()}" in mod headless. Completeaza .env (IG_USERNAME, IG_PASSWORD, IG_TOTP_SECRET).`, 'error');
-        return Promise.resolve('');
-    }
-    // Cat timp intrebam ceva, oprim ascultatorul de comenzi din consola.
-    // Altfel el citeste acelasi rand si raspunde "Comanda necunoscuta",
-    // iar username-ul/parola ajung in consola in loc sa ajunga la login.
-    inputBusy = true;
-    const done = (value, resolve) => { inputBusy = false; if (cli) cli.resume(); resolve(value); };
-    if (cli) cli.pause();
-
-    return new Promise((resolve) => {
-        if (!hidden) {
-            const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-            rl.question(question, (answer) => { rl.close(); done(answer.trim(), resolve); });
-            return;
-        }
-        process.stdout.write(question);
-        const stdin = process.stdin;
-        const wasRaw = stdin.isRaw;
-        stdin.setRawMode(true);
-        stdin.resume();
-        stdin.setEncoding('utf8');
-        let value = '';
-        const onData = (chunk) => {
-            if (chunk === '\n' || chunk === '\r' || chunk === '\r\n' || chunk === '\u0004') {
-                stdin.setRawMode(Boolean(wasRaw));
-                stdin.pause();
-                stdin.removeListener('data', onData);
-                process.stdout.write('\n');
-                done(value.trim(), resolve);
-                return;
-            }
-            if (chunk === '\u0003') { process.exit(0); }
-            if (chunk === '\u007F' || chunk === '\b') {
-                if (value.length) { value = value.slice(0, -1); process.stdout.write('\b \b'); }
-                return;
-            }
-            value += chunk;
-            process.stdout.write('*');
-        };
-        stdin.on('data', onData);
-    });
-}
-
-// ===================== 2FA AUTOMAT (TOTP) =====================
-
-// Genereaza codul din aplicatia de autentificare, plecand de la secretul base32.
-// Asa botul se poate reloga singur pe VPS, fara sa ceara cod la tastatura.
-function base32Decode(input) {
-    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-    const clean = String(input || '').toUpperCase().replace(/[^A-Z2-7]/g, '');
-    let bits = 0;
-    let value = 0;
-    const out = [];
-    for (const ch of clean) {
-        const idx = alphabet.indexOf(ch);
-        if (idx === -1) continue;
-        value = (value << 5) | idx;
-        bits += 5;
-        if (bits >= 8) {
-            bits -= 8;
-            out.push((value >>> bits) & 0xff);
-        }
-    }
-    return Buffer.from(out);
-}
-
-function totpCode(secret, atMs) {
-    const key = base32Decode(secret);
-    if (!key.length) return '';
-    const counter = Math.floor((atMs || Date.now()) / 1000 / 30);
-    const buf = Buffer.alloc(8);
-    buf.writeUInt32BE(Math.floor(counter / 0x100000000), 0);
-    buf.writeUInt32BE(counter >>> 0, 4);
-    const hmac = crypto.createHmac('sha1', key).update(buf).digest();
-    const offset = hmac[hmac.length - 1] & 0x0f;
-    const bin = ((hmac[offset] & 0x7f) << 24) | (hmac[offset + 1] << 16) | (hmac[offset + 2] << 8) | hmac[offset + 3];
-    return String(bin % 1000000).padStart(6, '0');
-}
-
-// ===================== SESIUNE =====================
-
-async function saveSession() {
-    try {
-        const state = await ig.state.serialize();
-        delete state.constants;
-        fs.writeFileSync(SESSION_FILE, JSON.stringify({ username: USERNAME, state }, null, 2));
-    } catch (e) {
-        log(`Nu am putut salva sesiunea: ${e.message}`, 'warn');
-    }
-}
-
-async function tryRestoreSession() {
-    if (!fs.existsSync(SESSION_FILE)) return false;
-    try {
-        const data = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8'));
-        if (!data.state || !data.username) return false;
-        USERNAME = data.username;
-        ig.state.generateDevice(USERNAME);
-        await ig.state.deserialize(data.state);
-        const me = await ig.account.currentUser();
-        myUserId = String(me.pk);
-        log(`Sesiune valida. Conectat ca ${me.username} (id ${myUserId})`, 'ok');
-        return true;
-    } catch (e) {
-        log(`Sesiunea salvata nu mai e valida (${e.message}). Fac login din nou.`, 'warn');
-        try { fs.unlinkSync(SESSION_FILE); } catch {}
-        return false;
-    }
-}
-
-// ===================== LOGIN =====================
-
-// Instagram nu trimite mereu IgCheckpointError: uneori raspunsul e un 400/467
-// obisnuit cu message="checkpoint_required" in body. Le tratam la fel.
-function isCheckpoint(err) {
-    if (err instanceof IgCheckpointError) return true;
-    const body = err && err.response && err.response.body;
-    if (body && (body.message === 'checkpoint_required' || body.checkpoint_url)) return true;
-    return /checkpoint_required|challenge_required/i.test(String(err && err.message));
+function explainLoginError(error) {
+  const body = error.response?.body || {};
+  if (error instanceof IgCheckpointError || body.checkpoint_url) {
+    return 'Instagram cere confirmarea conectării. Aprobă în aplicație și rulează din nou login.';
+  }
+  if (body.error_type === 'bad_password') return 'Parola este greșită.';
+  if (body.error_type === 'invalid_user') return 'Username-ul nu există.';
+  if (body.message === 'challenge_required') return 'Instagram a blocat temporar loginul automat.';
+  if (error.statusCode === 429) return 'Prea multe încercări. Așteaptă 15–30 de minute.';
+  return body.message || error.message || 'Eroare necunoscută la conectare.';
 }
 
 async function login() {
-    if (await tryRestoreSession()) {
-        loggedIn = true;
-        ig.request.end$.subscribe(() => { saveSession(); });
-        return true;
-    }
-
-    const username = (process.env.IG_USERNAME || '').trim() || await ask('Username Instagram: ');
-    const password = process.env.IG_PASSWORD || await ask('Parola Instagram (ascunsa): ', true);
-    if (!username || !password) {
-        log('Username sau parola lipsa.', 'error');
-        return false;
-    }
-
-    USERNAME = username;
-    ig.state.generateDevice(USERNAME);
-    ig.request.end$.subscribe(() => { saveSession(); });
-
-    try {
-        await ig.simulate.preLoginFlow();
-    } catch {
-        // pre-login flow poate esua pe unele retele, nu e fatal
-    }
-
-    let user;
-    try {
-        user = await ig.account.login(USERNAME, password);
-    } catch (err) {
-        if (err instanceof IgLoginTwoFactorRequiredError) {
-            const info = err.response.body.two_factor_info;
-            let code = '';
-            if (process.env.IG_TOTP_SECRET) {
-                code = totpCode(process.env.IG_TOTP_SECRET);
-                log('Cod 2FA generat automat din IG_TOTP_SECRET.');
-            } else {
-                code = await ask('Cod 2FA (din SMS sau aplicatie): ');
-            }
-            try {
-                // Numele corect in instagram-private-api este twoFactorLogin,
-                // iar raspunsul e body-ul brut, nu obiectul user.
-                const res = await ig.account.twoFactorLogin({
-                    username: USERNAME,
-                    verificationCode: code,
-                    twoFactorIdentifier: info.two_factor_identifier,
-                    verificationMethod: (process.env.IG_TOTP_SECRET || info.totp_two_factor_on) ? '0' : '1',
-                    trustThisDevice: '1',
-                });
-                user = res.logged_in_user || await ig.account.currentUser();
-            } catch (e2) {
-                log(`Cod 2FA respins: ${e2.message}`, 'error');
-                return false;
-            }
-        } else if (isCheckpoint(err)) {
-            log('Instagram cere verificare de securitate (checkpoint).', 'warn');
-            try {
-                await ig.challenge.auto(true);
-                const choice = ig.state.checkpoint && ig.state.checkpoint.step_name;
-                log(`Pas verificare: ${choice || 'necunoscut'}`);
-                const code = await ask('Cod primit pe email sau SMS: ');
-                await ig.challenge.sendSecurityCode(code);
-                user = await ig.account.currentUser();
-            } catch (e3) {
-                log(`Verificarea a esuat: ${e3.message}`, 'error');
-                log('Deschide aplicatia Instagram pe telefon, aproba cererea de logare / confirma ca esti tu, asteapta 10-15 minute, apoi scrie "start" din nou.', 'warn');
-                return false;
-            }
-        } else {
-            const body = err.response && err.response.body ? JSON.stringify(err.response.body) : err.message;
-            log(`Login esuat: ${body}`, 'error');
-            return false;
-        }
-    }
-
-    myUserId = String(user.pk);
-    await saveSession();
-    log(`Conectat ca ${user.username} (id ${myUserId})`, 'ok');
-    loggedIn = true;
-    return true;
-}
-
-// ===================== TRIMITERE =====================
-
-async function sendToThread(threadId, text) {
-    if (!text) return false;
-    try {
-        const gap = Date.now() - lastSendTime;
-        if (gap < MIN_SEND_GAP_MS) await sleep(MIN_SEND_GAP_MS - gap);
-        await ig.entity.directThread(String(threadId)).broadcastText(String(text));
-        lastSendTime = Date.now();
-        return true;
-    } catch (e) {
-        log(`Nu am putut trimite in thread ${threadId}: ${e.message}`, 'error');
-        return false;
-    }
-}
-
-async function sendToUser(userId, text) {
-    if (!text) return false;
-    try {
-        const gap = Date.now() - lastSendTime;
-        if (gap < MIN_SEND_GAP_MS) await sleep(MIN_SEND_GAP_MS - gap);
-        await ig.entity.directThread([String(userId)]).broadcastText(String(text));
-        lastSendTime = Date.now();
-        return true;
-    } catch (e) {
-        log(`Nu am putut trimite catre ${userId}: ${e.message}`, 'error');
-        return false;
-    }
-}
-
-// instagram-private-api nu expune o metoda de reactie, deci apelam direct
-// endpointul folosit de aplicatie.
-async function likeItem(threadId, itemId) {
-    if (!threadId || !itemId) return false;
-    try {
-        await ig.request.send({
-            url: '/api/v1/direct_v2/threads/broadcast/reaction/',
-            method: 'POST',
-            form: ig.request.sign({
-                thread_ids: JSON.stringify([String(threadId)]),
-                item_id: String(itemId),
-                node_type: 'item',
-                reaction_type: 'like',
-                reaction_status: 'created',
-                emoji: LIKE_EMOJI,
-                action: 'send_item',
-                client_context: ig.state.clientSessionId,
-                mutation_token: String(Date.now()),
-                _csrftoken: ig.state.cookieCsrfToken,
-                _uuid: ig.state.uuid,
-            }),
-        });
-        return true;
-    } catch (e) {
-        log(`Nu am putut da like la mesaj: ${e.message}`, 'warn');
-        return false;
-    }
-}
-
-async function resolveUser(name) {
-    const clean = String(name || '').replace('@', '').trim();
-    if (!clean) return null;
-    try {
-        const id = await ig.user.getIdByUsername(clean);
-        return { id: String(id), username: clean };
-    } catch {
-        return null;
-    }
-}
-
-// ===================== SALVARE IMAGINI =====================
-
-async function saveImageFromUrl(url, sender, isViewOnce) {
-    try {
-        const dir = path.join(DATA_DIR, isViewOnce ? 'view_once' : 'saved_images');
-        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-        const res = await fetch(url);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const buffer = Buffer.from(await res.arrayBuffer());
-        const filename = `${isViewOnce ? 'view_once' : 'image'}_${Date.now()}_${sender}.jpg`;
-        const filepath = path.join(dir, filename);
-        fs.writeFileSync(filepath, buffer);
-        savedImages.push({ filename, filepath, sender, viewOnce: Boolean(isViewOnce), timestamp: Date.now() });
-        log(`Imagine salvata: ${filename}`, 'ok');
-        return filepath;
-    } catch (e) {
-        log(`Nu am putut salva imaginea: ${e.message}`, 'error');
-        return null;
-    }
-}
-
-function extractImageUrl(item) {
-    const media = item.visual_media && item.visual_media.media ? item.visual_media.media : item.media;
-    if (!media) return null;
-    const candidates = media.image_versions2 && media.image_versions2.candidates;
-    return candidates && candidates.length ? candidates[0].url : null;
-}
-
-function isViewOnce(item) {
-    if (item.visual_media && item.visual_media.view_mode) return item.visual_media.view_mode !== 'permanent';
-    if (item.media && item.media.view_mode) return item.media.view_mode === 'once';
+  if (state.running) {
+    log('Oprește botul înainte de un login nou.', 'warn');
     return false;
+  }
+  console.log('\nCONECTARE INSTAGRAM\n');
+  const username = readlineSync.question('Username: ').trim().replace(/^@/, '');
+  if (!username) return log('Username-ul nu poate fi gol.', 'error'), false;
+  const password = readlineSync.question('Parola: ', { hideEchoBack: true, mask: '•' });
+  if (!password) return log('Parola nu poate fi goală.', 'error'), false;
+
+  try {
+    deleteSession();
+    state.username = username;
+    ig.state.generateDevice(username);
+    await ig.simulate.preLoginFlow();
+
+    let account;
+    try {
+      account = await ig.account.login(username, password);
+    } catch (error) {
+      if (!(error instanceof IgLoginTwoFactorRequiredError)) throw error;
+      log('Autentificarea în doi pași este activă.', 'warn');
+      account = await completeTwoFactor(username, error);
+    }
+    if (!account) throw new Error('Instagram nu a returnat contul conectat.');
+    state.userId = String(account.pk);
+    state.connected = true;
+    saveSession();
+    ig.simulate.postLoginFlow().catch(() => {});
+    log(`Conectat ca @${account.username}.`, 'ok');
+    return true;
+  } catch (error) {
+    state.connected = false;
+    log(explainLoginError(error), 'error');
+    return false;
+  }
 }
 
-// ===================== TEXT COMENZI =====================
+/* ─────────────── HELP ─────────────── */
 
-function helpText() {
-    return [
-        'BOT INSTAGRAM - LISTA COMENZI',
-        '',
-        'BAZA',
-        '$help - afiseaza acest mesaj',
-        '$ping - test conexiune',
-        '$status - starea botului',
-        '$uptime - de cat timp ruleaza',
-        '',
-        'REPLY AUTOMAT',
-        '$reply [user] - adauga user la reply automat',
-        '$stopreply [user] - opreste reply (fara user opreste tot)',
-        '$replydelay [sec] - seteaza delay reply (1-30)',
-        '$replylist - lista targetelor de reply',
-        '',
-        'SPAM',
-        '$spam [user] [text] - porneste spam catre user',
-        '$stopspam - opreste spamul',
-        '$spamdelay [sec] - seteaza delay spam (1-30)',
-        '',
-        'MOCK SI COPY',
-        '$mock [user] - raspunde cu text alternat',
-        '$stopmock [user] - opreste mock',
-        '$copymsg [user] - copiaza mesajele userului',
-        '$stopcopy [user] - opreste copy',
-        '',
-        'IMAGINI',
-        '$vvlist - lista imaginilor salvate',
-        '$vvclear - sterge imaginile view once salvate',
-        '',
-        'NOTEPAD (notite personale)',
-        '$note add [text] - adauga o notita',
-        '$note list - arata notitele tale',
-        '$note delete [numar] - sterge o notita',
-        '$note clear - sterge toate notitele',
-        '',
-        'ALTELE',
-        '$afk [motiv] - activeaza modul afk',
-        '$stopafk - opreste modul afk',
-        '$reverse - raspunde cu textul inversat',
-        '$stopreverse - opreste reverse',
-        '$autolike [user] - da like automat la mesajele userului',
-        '$stopautolike [user] - opreste autolike',
-        '$mention [user] - mentioneaza userul in raspunsuri',
-        '$stopmention - opreste mentionarea',
-        '$target [user] - seteaza tinta manuala',
-        '$untarget - sterge tinta manuala',
-        '$listtargets - toate targetele active',
-        '$clearall - opreste toate functiile',
-        '',
-        'FRAZE (fisiere .txt in folderul botului)',
-        '$addnotepad - reincarca spam.txt',
-        '$addreply - reincarca reply.txt',
-        '$addbeef - reincarca beef.txt',
-        '$listphrases - cate fraze sunt incarcate',
-    ].join('\n');
+const HELP_DOLLAR = `${SCRIPT_NAME} — comenzi $
+$help / $list          lista comenzilor
+$ping                  test rapid
+$status                starea botului
+$uptime                de cât timp rulează
+$afk [motiv]           răspuns automat AFK
+$afkcheck              afișează starea AFK
+$reply [userID]        auto-răspuns din notepad reply
+$stopreply [userID]    oprește auto-răspunsul
+$customreply [id] [txt] răspuns fix pentru un user
+$stopcustomreply [id]  oprește răspunsul fix
+$listcustomreply       lista răspunsurilor fixe
+$replydelay [sec]      delay între răspunsuri
+$mock [userID]         rescrie mesajele aLtErNaTiNg
+$stopmock [userID]     oprește mock
+$copymsg [userID]      repetă tot ce scrie
+$stopcopy [userID]     oprește copymsg
+$reverse               răspunde cu textul inversat
+$stopreverse           oprește reverse
+$mention [userID]      marchează un target
+$stopmention           oprește mention
+$autoreact [id] [emoji] reacționează automat
+$stopautoreact [id]    oprește reacția
+$antitrap              blochează linkurile suspecte
+$snipe                 ultimul mesaj șters/retras
+$seen                  marchează conversațiile ca citite
+$typing                typing fals în conversație
+$stoptyping            oprește typing fals
+$listtargets           toți targeții activi
+$clearall              resetează tot`;
+
+const HELP_EQUAL = `${SCRIPT_NAME} — comenzi =
+=start [text] [nr] [sec]  trimite text de N ori în conversație
+=stop                     oprește trimiterea
+=repeat [text] [sec]      repetă text la interval
+=stoprepeat               oprește repeat
+=delay [sec]              delay pentru start
+=groupname [nume]         schimbă numele grupului
+=members                  membrii conversației
+=tagall [text]            menționează toți membrii
+=info                     info conversație
+=avatar [user]            poza de profil
+=profile [user]           info profil public
+=weather [oras]           vremea`;
+
+const HELP_EXCL = `${SCRIPT_NAME} — comenzi !
+!notepadspam [linie]   adaugă linie în notepad spam
+!notepadreply [linie]  adaugă linie în notepad reply
+!notepadbeef [linie]   adaugă linie în notepad beef
+!notepadgroup [linie]  adaugă linie în notepad grup
+!listnotepad [tip]     afișează notepad (spam/reply/beef/group)
+!clearnotepad [tip]    golește notepad
+!unsend                retrage ultimul mesaj trimis
+!id                    ID-ul conversației și al userului
+!ping                  latență
+!help                  lista comenzilor !`;
+
+/* ─────────────── HELPERS INSTAGRAM ─────────────── */
+
+async function send(thread, text) {
+  if (!text) return;
+  try {
+    await thread.broadcastText(String(text).slice(0, 900));
+  } catch (error) {
+    log(`Trimitere eșuată: ${error.message}`, 'error');
+  }
 }
 
-function statusText() {
-    const totalNotes = Object.values(notepad.notes).reduce((sum, list) => sum + list.length, 0);
-    return [
-        'STATUS BOT',
-        `Utilizator: @${USERNAME}`,
-        `Ruleaza: ${running ? 'da' : 'nu'}`,
-        `Uptime: ${uptime()}`,
-        `Imagini salvate: ${savedImages.length}`,
-        `Notite salvate: ${totalNotes}`,
-        `Targete reply: ${replyState.targets.length}`,
-        `Spam: ${spamState.running ? 'activ' : 'inactiv'}`,
-        `Mock: ${Object.keys(mockTargets).length} targete`,
-        `Copy: ${Object.keys(copyTargets).length} targete`,
-        `Autolike: ${Object.keys(autolikeTargets).length} targete`,
-        `Reverse: ${reverseMode ? 'activ' : 'inactiv'}`,
-        `AFK: ${afkState.active ? `activ (${afkState.reason})` : 'inactiv'}`,
-    ].join('\n');
+async function resolveUser(arg) {
+  if (!arg) return null;
+  const clean = String(arg).replace(/^@/, '');
+  if (/^\d+$/.test(clean)) return { pk: clean, username: clean };
+  try {
+    const user = await ig.user.searchExact(clean);
+    return { pk: String(user.pk), username: user.username };
+  } catch {
+    return null;
+  }
 }
 
-// ===================== HANDLER COMENZI =====================
+async function getWeather(city) {
+  const res = await fetch(`https://wttr.in/${encodeURIComponent(city)}?format=3&m`);
+  return res.text();
+}
 
-// replyFn permite rularea aceleiasi comenzi din terminal:
-// raspunsul se scrie in consola in loc sa plece intr-un DM.
-async function handleCommand(threadId, senderId, senderName, rawText, replyFn) {
-    const body = rawText.startsWith(PREFIX) ? rawText.slice(PREFIX.length) : rawText;
-    const parts = body.trim().split(/\s+/);
-    const cmd = (parts.shift() || '').toLowerCase();
-    const args = parts;
-    const reply = replyFn || ((msg) => sendToThread(threadId, msg));
+/* ─────────────── ROUTER COMENZI DM ─────────────── */
 
+async function handleCommand(thread, threadInfo, prefix, cmd, args, senderId) {
+  const argText = args.join(' ');
+  const threadId = threadInfo.thread_id;
+
+  // ── comenzi $ ──
+  if (prefix === '$') {
     switch (cmd) {
-        case 'help':
-        case 'h':
-        case 'comenzi':
-        case 'list':
-            await reply(helpText());
-            return;
-
-        case 'ping': {
-            const t0 = Date.now();
-            await reply('Pong');
-            await reply(`Latenta: ${Date.now() - t0} ms`);
-            return;
-        }
-
-        case 'status':
-            await reply(statusText());
-            return;
-
-        case 'uptime':
-            await reply(`Uptime: ${uptime()}`);
-            return;
-
-        case 'reply': {
-            if (!args.length) return reply('Foloseste: $reply [username]');
-            const t = await resolveUser(args[0]);
-            if (!t) return reply(`Userul @${args[0]} nu a fost gasit`);
-            if (replyState.targets.includes(t.id)) return reply(`@${t.username} este deja in lista`);
-            if (replyState.targets.length >= 20) return reply('Limita de 20 de targete a fost atinsa');
-            replyState.targets.push(t.id);
-            replyState.running = true;
-            if (!replyWords.length) replyWords = loadPhrases('reply.txt');
-            return reply(`Reply activat pentru @${t.username} (${replyState.targets.length}/20)`);
-        }
-
-        case 'stopreply': {
-            if (!args.length) {
-                replyState.running = false;
-                replyState.targets = [];
-                replyState.lastReplyTime = {};
-                return reply('Reply oprit pentru toti');
-            }
-            const t = await resolveUser(args[0]);
-            if (!t) return reply(`Userul @${args[0]} nu a fost gasit`);
-            const idx = replyState.targets.indexOf(t.id);
-            if (idx === -1) return reply(`@${t.username} nu este in lista`);
-            replyState.targets.splice(idx, 1);
-            if (!replyState.targets.length) replyState.running = false;
-            return reply(`Reply oprit pentru @${t.username} (${replyState.targets.length} ramase)`);
-        }
-
-        case 'replydelay': {
-            if (!args.length) return reply(`Delay reply curent: ${replyDelay}s`);
-            const sec = parseInt(args[0], 10);
-            if (!Number.isFinite(sec) || sec < 1 || sec > 30) return reply('Valoare permisa: 1-30 secunde');
-            replyDelay = sec;
-            return reply(`Delay reply setat la ${sec}s`);
-        }
-
-        case 'replylist':
-            if (!replyState.targets.length) return reply('Niciun target de reply activ');
-            return reply(`Targete reply (${replyState.targets.length}):\n${replyState.targets.join('\n')}`);
-
-        case 'spam': {
-            if (args.length < 2) return reply('Foloseste: $spam [username] [text]');
-            if (spamState.running) return reply('Spamul ruleaza deja. Opreste-l cu $stopspam');
-            const t = await resolveUser(args[0]);
-            if (!t) return reply(`Userul @${args[0]} nu a fost gasit`);
-            const text = args.slice(1).join(' ');
-            spamState.running = true;
-            spamState.target = t.id;
-            spamState.targetName = t.username;
-            spamState.text = text;
-            spamState.phraseIndex = 0;
-            if (spamState.timer) clearInterval(spamState.timer);
-            spamState.timer = setInterval(async () => {
-                if (!spamState.running) { clearInterval(spamState.timer); spamState.timer = null; return; }
-                const phrase = spamPhrases.length
-                    ? spamPhrases[spamState.phraseIndex % spamPhrases.length]
-                    : spamState.text;
-                spamState.phraseIndex += 1;
-                await sendToUser(spamState.target, phrase);
-            }, Math.max(spamDelay, 2) * 1000);
-            return reply(`Spam pornit catre @${t.username} (delay ${spamDelay}s)`);
-        }
-
-        case 'stopspam':
-            if (!spamState.running) return reply('Spamul nu este pornit');
-            spamState.running = false;
-            if (spamState.timer) { clearInterval(spamState.timer); spamState.timer = null; }
-            spamState.target = null;
-            return reply('Spam oprit');
-
-        case 'spamdelay': {
-            if (!args.length) return reply(`Delay spam curent: ${spamDelay}s`);
-            const sec = parseInt(args[0], 10);
-            if (!Number.isFinite(sec) || sec < 1 || sec > 30) return reply('Valoare permisa: 1-30 secunde');
-            spamDelay = sec;
-            return reply(`Delay spam setat la ${sec}s`);
-        }
-
-        case 'mock': {
-            if (!args.length) return reply('Foloseste: $mock [username]');
-            const t = await resolveUser(args[0]);
-            if (!t) return reply(`Userul @${args[0]} nu a fost gasit`);
-            mockTargets[t.id] = t.username;
-            return reply(`Mock activat pentru @${t.username}`);
-        }
-
-        case 'stopmock': {
-            if (!args.length) {
-                Object.keys(mockTargets).forEach((k) => delete mockTargets[k]);
-                return reply('Mock oprit pentru toti');
-            }
-            const t = await resolveUser(args[0]);
-            if (!t) return reply(`Userul @${args[0]} nu a fost gasit`);
-            if (!mockTargets[t.id]) return reply(`@${t.username} nu are mock activ`);
-            delete mockTargets[t.id];
-            return reply(`Mock oprit pentru @${t.username}`);
-        }
-
-        case 'copymsg': {
-            if (!args.length) return reply('Foloseste: $copymsg [username]');
-            const t = await resolveUser(args[0]);
-            if (!t) return reply(`Userul @${args[0]} nu a fost gasit`);
-            copyTargets[t.id] = t.username;
-            return reply(`Copy activat pentru @${t.username}`);
-        }
-
-        case 'stopcopy': {
-            if (!args.length) {
-                Object.keys(copyTargets).forEach((k) => delete copyTargets[k]);
-                return reply('Copy oprit pentru toti');
-            }
-            const t = await resolveUser(args[0]);
-            if (!t) return reply(`Userul @${args[0]} nu a fost gasit`);
-            if (!copyTargets[t.id]) return reply(`@${t.username} nu are copy activ`);
-            delete copyTargets[t.id];
-            return reply(`Copy oprit pentru @${t.username}`);
-        }
-
-        case 'autolike': {
-            if (!args.length) return reply('Foloseste: $autolike [username]');
-            const t = await resolveUser(args[0]);
-            if (!t) return reply(`Userul @${args[0]} nu a fost gasit`);
-            autolikeTargets[t.id] = t.username;
-            return reply(`Autolike activat pentru @${t.username}`);
-        }
-
-        case 'stopautolike': {
-            if (!args.length) {
-                Object.keys(autolikeTargets).forEach((k) => delete autolikeTargets[k]);
-                return reply('Autolike oprit pentru toti');
-            }
-            const t = await resolveUser(args[0]);
-            if (!t) return reply(`Userul @${args[0]} nu a fost gasit`);
-            if (!autolikeTargets[t.id]) return reply(`@${t.username} nu are autolike activ`);
-            delete autolikeTargets[t.id];
-            return reply(`Autolike oprit pentru @${t.username}`);
-        }
-
-        case 'mention': {
-            if (!args.length) return reply('Foloseste: $mention [username]');
-            const t = await resolveUser(args[0]);
-            if (!t) return reply(`Userul @${args[0]} nu a fost gasit`);
-            mentionTargetId = t.id;
-            mentionTargetName = t.username;
-            return reply(`Mentionare activata pentru @${t.username}`);
-        }
-
-        case 'stopmention':
-            mentionTargetId = null;
-            mentionTargetName = '';
-            return reply('Mentionare oprita');
-
-        case 'target': {
-            if (!args.length) return reply('Foloseste: $target [username]');
-            const t = await resolveUser(args[0]);
-            if (!t) return reply(`Userul @${args[0]} nu a fost gasit`);
-            manualTargetId = t.id;
-            manualTargetName = t.username;
-            return reply(`Tinta setata: @${t.username}`);
-        }
-
-        case 'untarget':
-            if (!manualTargetId) return reply('Nu exista o tinta setata');
-            manualTargetId = null;
-            manualTargetName = '';
-            return reply('Tinta a fost stearsa');
-
-        case 'afk':
-            afkState.active = true;
-            afkState.reason = args.join(' ') || 'fara motiv';
-            afkState.notified = {};
-            return reply(`Mod AFK activat: ${afkState.reason}`);
-
-        case 'stopafk':
-            afkState.active = false;
-            afkState.reason = '';
-            afkState.notified = {};
-            return reply('Mod AFK oprit');
-
-        case 'reverse':
-            reverseMode = true;
-            return reply('Mod reverse activat');
-
-        case 'stopreverse':
-            reverseMode = false;
-            return reply('Mod reverse oprit');
-
-        case 'vvlist': {
-            if (!savedImages.length) return reply('Nicio imagine salvata');
-            const lines = savedImages.slice(-15).map((img, i) => `${i + 1}. ${img.filename} de la @${img.sender}`);
-            return reply(`Imagini salvate (${savedImages.length}):\n${lines.join('\n')}`);
-        }
-
-        case 'vvclear': {
-            const dir = path.join(DATA_DIR, 'view_once');
-            let count = 0;
-            try {
-                if (fs.existsSync(dir)) {
-                    for (const f of fs.readdirSync(dir)) { fs.unlinkSync(path.join(dir, f)); count += 1; }
-                }
-            } catch (e) {
-                return reply(`Nu am putut sterge: ${e.message}`);
-            }
-            savedImages.length = 0;
-            return reply(`Sterse ${count} imagini view once`);
-        }
-
-        case 'addnotepad':
-        case 'addspam':
-            spamPhrases = loadPhrases('spam.txt');
-            return reply(`Incarcate ${spamPhrases.length} fraze din spam.txt`);
-
-        case 'addreply':
-            replyWords = loadPhrases('reply.txt');
-            return reply(`Incarcate ${replyWords.length} fraze din reply.txt`);
-
-        case 'addbeef':
-            beefPhrases = loadPhrases('beef.txt');
-            return reply(`Incarcate ${beefPhrases.length} fraze din beef.txt`);
-
-        case 'listphrases':
-            return reply([
-                `spam.txt: ${spamPhrases.length} fraze`,
-                `reply.txt: ${replyWords.length} fraze`,
-                `beef.txt: ${beefPhrases.length} fraze`,
-            ].join('\n'));
-
-        case 'listtargets':
-            return reply([
-                'TARGETE ACTIVE',
-                `Reply: ${replyState.targets.length ? replyState.targets.join(', ') : 'niciunul'}`,
-                `Mock: ${Object.values(mockTargets).join(', ') || 'niciunul'}`,
-                `Copy: ${Object.values(copyTargets).join(', ') || 'niciunul'}`,
-                `Autolike: ${Object.values(autolikeTargets).join(', ') || 'niciunul'}`,
-                `Spam: ${spamState.running ? spamState.targetName : 'niciunul'}`,
-                `Mention: ${mentionTargetName || 'niciunul'}`,
-                `Tinta manuala: ${manualTargetName || 'niciuna'}`,
-            ].join('\n'));
-
-        case 'note':
-        case 'notes':
-        case 'notepad': {
-            const sub = (args.shift() || '').toLowerCase();
-            const rest = args.join(' ');
-            switch (sub) {
-                case 'add':
-                case 'adauga':
-                    return reply(notepadAdd(senderId, rest));
-                case 'list':
-                case 'lista':
-                case '':
-                    return reply(notepadList(senderId));
-                case 'delete':
-                case 'sterge':
-                case 'del': {
-                    const idx = parseInt(args[0], 10);
-                    if (!Number.isFinite(idx)) return reply('Foloseste: $note delete [numar]');
-                    return reply(notepadDelete(senderId, idx));
-                }
-                case 'clear':
-                case 'curata':
-                    return reply(notepadClear(senderId));
-                case 'help':
-                case '?':
-                default:
-                    return reply(notepadHelp());
-            }
-        }
-
-        case 'clearall':
-            replyState.running = false;
-            replyState.targets = [];
-            replyState.lastReplyTime = {};
-            spamState.running = false;
-            if (spamState.timer) { clearInterval(spamState.timer); spamState.timer = null; }
-            Object.keys(mockTargets).forEach((k) => delete mockTargets[k]);
-            Object.keys(copyTargets).forEach((k) => delete copyTargets[k]);
-            Object.keys(autolikeTargets).forEach((k) => delete autolikeTargets[k]);
-            reverseMode = false;
-            mentionTargetId = null;
-            mentionTargetName = '';
-            manualTargetId = null;
-            manualTargetName = '';
-            afkState.active = false;
-            return reply('Toate functiile au fost oprite');
-
-        default:
-            return reply(`Comanda "${PREFIX}${cmd}" nu exista. Scrie ${PREFIX}help pentru lista completa.`);
+      case 'help':
+      case 'list':
+        return send(thread, HELP_DOLLAR);
+      case 'ping':
+        return send(thread, 'Pong!');
+      case 'status':
+        return send(thread, `conectat: @${state.username} | rulează: ${state.running ? 'da' : 'nu'} | afk: ${state.afk ? 'da' : 'nu'} | reverse: ${state.reverse ? 'da' : 'nu'}`);
+      case 'uptime':
+        return send(thread, `uptime: ${uptime()} | @${state.username}`);
+      case 'afk':
+        state.afk = !state.afk;
+        state.afkReason = state.afk ? argText : '';
+        return send(thread, `afk ${state.afk ? `activat${state.afkReason ? ` (${state.afkReason})` : ''}` : 'dezactivat'}`);
+      case 'afkcheck':
+        return send(thread, state.afk ? `afk activ${state.afkReason ? `: ${state.afkReason}` : ''}` : 'afk inactiv');
+      case 'reply': {
+        const user = await resolveUser(args[0]);
+        if (!user) return send(thread, '$reply [userID/username]');
+        state.replyTargets.add(user.pk);
+        return send(thread, `auto-reply activat: ${user.username}`);
+      }
+      case 'stopreply': {
+        if (!args.length) { state.replyTargets.clear(); return send(thread, 'auto-reply oprit pentru toți'); }
+        const user = await resolveUser(args[0]);
+        if (user) state.replyTargets.delete(user.pk);
+        return send(thread, 'auto-reply oprit');
+      }
+      case 'customreply': {
+        const user = await resolveUser(args[0]);
+        if (!user || args.length < 2) return send(thread, '$customreply [user] [text]');
+        state.customReply[user.pk] = args.slice(1).join(' ');
+        return send(thread, `customreply activat: ${user.username}`);
+      }
+      case 'stopcustomreply': {
+        const user = await resolveUser(args[0]);
+        if (user) delete state.customReply[user.pk];
+        return send(thread, 'customreply oprit');
+      }
+      case 'listcustomreply': {
+        const keys = Object.keys(state.customReply);
+        return send(thread, keys.length ? keys.map((k) => `${k}: ${state.customReply[k]}`).join('\n') : 'niciun customreply');
+      }
+      case 'replydelay': {
+        const sec = Number(args[0]);
+        if (!sec) return send(thread, `delay curent: ${state.replyDelay / 1000}s`);
+        state.replyDelay = Math.max(1, sec) * 1000;
+        return send(thread, `delay setat: ${sec}s`);
+      }
+      case 'mock': {
+        const user = await resolveUser(args[0]);
+        if (!user) return send(thread, '$mock [user]');
+        state.mockTargets.add(user.pk);
+        return send(thread, `mock activat: ${user.username}`);
+      }
+      case 'stopmock': {
+        if (!args.length) { state.mockTargets.clear(); return send(thread, 'mock oprit pentru toți'); }
+        const user = await resolveUser(args[0]);
+        if (user) state.mockTargets.delete(user.pk);
+        return send(thread, 'mock oprit');
+      }
+      case 'copymsg': {
+        const user = await resolveUser(args[0]);
+        if (!user) return send(thread, '$copymsg [user]');
+        state.copyTargets.add(user.pk);
+        return send(thread, `copymsg activat: ${user.username}`);
+      }
+      case 'stopcopy': {
+        if (!args.length) { state.copyTargets.clear(); return send(thread, 'copymsg oprit pentru toți'); }
+        const user = await resolveUser(args[0]);
+        if (user) state.copyTargets.delete(user.pk);
+        return send(thread, 'copymsg oprit');
+      }
+      case 'reverse':
+        state.reverse = !state.reverse;
+        return send(thread, `reverse ${state.reverse ? 'activat' : 'dezactivat'}`);
+      case 'stopreverse':
+        state.reverse = false;
+        return send(thread, 'reverse dezactivat');
+      case 'mention': {
+        if (!args.length) return send(thread, `mention: ${state.mentionTarget || 'niciunul'}`);
+        const user = await resolveUser(args[0]);
+        if (!user) return send(thread, 'user negăsit');
+        state.mentionTarget = user.username;
+        return send(thread, `mention activat: @${user.username}`);
+      }
+      case 'stopmention':
+        state.mentionTarget = null;
+        return send(thread, 'mention dezactivat');
+      case 'autoreact': {
+        const user = await resolveUser(args[0]);
+        if (!user || !args[1]) return send(thread, '$autoreact [user] [emoji]');
+        state.reactTargets[user.pk] = args[1];
+        return send(thread, `autoreact ${args[1]} activat: ${user.username}`);
+      }
+      case 'stopautoreact': {
+        const user = await resolveUser(args[0]);
+        if (user) delete state.reactTargets[user.pk];
+        return send(thread, 'autoreact oprit');
+      }
+      case 'antitrap':
+        state.antitrap = !state.antitrap;
+        return send(thread, `antitrap ${state.antitrap ? 'activat' : 'dezactivat'}`);
+      case 'stopantitrap':
+        state.antitrap = false;
+        return send(thread, 'antitrap dezactivat');
+      case 'snipe': {
+        const s = state.snipe[threadId];
+        if (!s) return send(thread, 'niciun mesaj în cache');
+        const ago = Math.floor((Date.now() - s.at) / 1000);
+        return send(thread, `${s.user} (${ago}s în urmă): ${s.text}`);
+      }
+      case 'seen':
+        try { await thread.markItemSeen(threadInfo.items?.[0]?.item_id); } catch {}
+        return send(thread, 'marcat ca văzut');
+      case 'typing': {
+        if (state.typing.has(threadId)) return send(thread, 'typing deja activ');
+        const iv = setInterval(() => { thread.markActivity?.(true).catch?.(() => {}); }, 8000);
+        state.typing.set(threadId, iv);
+        return send(thread, 'typing fals activat');
+      }
+      case 'stoptyping': {
+        const iv = state.typing.get(threadId);
+        if (iv) clearInterval(iv);
+        state.typing.delete(threadId);
+        return send(thread, 'typing fals oprit');
+      }
+      case 'listtargets': {
+        const lines = [];
+        if (state.replyTargets.size) lines.push(`REPLY: ${[...state.replyTargets].join(', ')}`);
+        if (Object.keys(state.customReply).length) lines.push(`CUSTOMREPLY: ${Object.keys(state.customReply).join(', ')}`);
+        if (state.mockTargets.size) lines.push(`MOCK: ${[...state.mockTargets].join(', ')}`);
+        if (state.copyTargets.size) lines.push(`COPY: ${[...state.copyTargets].join(', ')}`);
+        if (Object.keys(state.reactTargets).length) lines.push(`AUTOREACT: ${Object.keys(state.reactTargets).join(', ')}`);
+        if (state.spam.running) lines.push('SPAM: activ');
+        if (state.repeat.running) lines.push('REPEAT: activ');
+        return send(thread, lines.length ? `TARGEȚI ACTIVI:\n${lines.join('\n')}` : 'niciun target activ');
+      }
+      case 'clearall': {
+        state.replyTargets.clear();
+        state.mockTargets.clear();
+        state.copyTargets.clear();
+        state.customReply = {};
+        state.reactTargets = {};
+        state.mentionTarget = null;
+        state.reverse = false;
+        state.afk = false;
+        state.spam.running = false;
+        state.repeat.running = false;
+        for (const iv of state.typing.values()) clearInterval(iv);
+        state.typing.clear();
+        return send(thread, 'totul a fost resetat');
+      }
+      default:
+        return send(thread, `comandă necunoscută: $${cmd} — scrie $help`);
     }
+  }
+
+  // ── comenzi = ──
+  if (prefix === '=') {
+    switch (cmd) {
+      case 'help':
+      case 'list':
+        return send(thread, HELP_EQUAL);
+      case 'start': {
+        if (!args.length) return send(thread, '=start [text] [nr] [sec]');
+        const sec = Number(args[args.length - 1]);
+        const nr = Number(args[args.length - 2]);
+        const hasNums = Number.isFinite(sec) && Number.isFinite(nr);
+        const text = hasNums ? args.slice(0, -2).join(' ') : argText;
+        state.spam = {
+          running: true,
+          threadId,
+          text: text || pick(loadLines(SPAM_NOTES_FILE), 'salut'),
+          delay: Math.max(2, hasNums ? sec : 3) * 1000,
+          left: Math.min(hasNums ? nr : 5, 50),
+        };
+        runSpam(thread);
+        return send(thread, `pornit: ${state.spam.left} mesaje la ${state.spam.delay / 1000}s`);
+      }
+      case 'stop':
+        state.spam.running = false;
+        return send(thread, 'oprit');
+      case 'repeat': {
+        if (!args.length) return send(thread, '=repeat [text] [sec]');
+        const sec = Number(args[args.length - 1]);
+        const hasSec = Number.isFinite(sec);
+        state.repeat = {
+          running: true,
+          threadId,
+          text: hasSec ? args.slice(0, -1).join(' ') : argText,
+          delay: Math.max(5, hasSec ? sec : 10) * 1000,
+        };
+        runRepeat(thread);
+        return send(thread, `repeat pornit la ${state.repeat.delay / 1000}s`);
+      }
+      case 'stoprepeat':
+        state.repeat.running = false;
+        return send(thread, 'repeat oprit');
+      case 'delay': {
+        const sec = Number(args[0]);
+        if (!sec) return send(thread, `delay: ${state.spam.delay / 1000}s`);
+        state.spam.delay = Math.max(2, sec) * 1000;
+        return send(thread, `delay setat: ${sec}s`);
+      }
+      case 'groupname': {
+        if (!argText) return send(thread, '=groupname [nume]');
+        try {
+          await thread.updateTitle(argText);
+          return send(thread, `nume schimbat: ${argText}`);
+        } catch (e) {
+          return send(thread, `nu am putut schimba numele: ${e.message}`);
+        }
+      }
+      case 'members': {
+        const users = threadInfo.users || [];
+        return send(thread, users.length ? users.map((u) => `@${u.username} (${u.pk})`).join('\n') : 'fără membri');
+      }
+      case 'tagall': {
+        const users = (threadInfo.users || []).map((u) => `@${u.username}`).join(' ');
+        return send(thread, `${users} ${argText}`.trim());
+      }
+      case 'info':
+        return send(thread, `thread: ${threadId}\nnume: ${threadInfo.thread_title || '-'}\nmembri: ${(threadInfo.users || []).length}`);
+      case 'avatar': {
+        const user = await resolveUser(args[0] || state.username);
+        if (!user) return send(thread, 'user negăsit');
+        try {
+          const info = await ig.user.info(user.pk);
+          return send(thread, info.profile_pic_url);
+        } catch {
+          return send(thread, 'nu am putut lua poza');
+        }
+      }
+      case 'profile': {
+        const user = await resolveUser(args[0] || state.username);
+        if (!user) return send(thread, 'user negăsit');
+        try {
+          const info = await ig.user.info(user.pk);
+          return send(thread, `@${info.username}\n${info.full_name || ''}\nfollowers: ${info.follower_count} | following: ${info.following_count}\nposts: ${info.media_count}\n${info.biography || ''}`);
+        } catch {
+          return send(thread, 'profil indisponibil');
+        }
+      }
+      case 'weather': {
+        if (!argText) return send(thread, '=weather [oras]');
+        try {
+          return send(thread, await getWeather(argText));
+        } catch {
+          return send(thread, 'nu am putut lua vremea');
+        }
+      }
+      default:
+        return send(thread, `comandă necunoscută: =${cmd} — scrie =help`);
+    }
+  }
+
+  // ── comenzi ! ──
+  if (prefix === '!') {
+    const files = {
+      spam: SPAM_NOTES_FILE,
+      reply: REPLY_NOTES_FILE,
+      beef: BEEF_NOTES_FILE,
+      group: GROUP_NOTES_FILE,
+    };
+    switch (cmd) {
+      case 'help':
+      case 'list':
+        return send(thread, HELP_EXCL);
+      case 'ping':
+        return send(thread, `pong — ${Date.now() % 1000}ms`);
+      case 'id':
+        return send(thread, `thread: ${threadId}\nuser: ${senderId}\ncont: ${state.userId}`);
+      case 'notepadspam':
+      case 'notepadreply':
+      case 'notepadbeef':
+      case 'notepadgroup': {
+        if (!argText) return send(thread, `!${cmd} [linie]`);
+        appendLine(files[cmd.replace('notepad', '')], argText);
+        return send(thread, 'linie adăugată');
+      }
+      case 'listnotepad': {
+        const file = files[args[0]];
+        if (!file) return send(thread, '!listnotepad [spam/reply/beef/group]');
+        const lines = loadLines(file);
+        return send(thread, lines.length ? lines.slice(0, 30).join('\n') : 'notepad gol');
+      }
+      case 'clearnotepad': {
+        const file = files[args[0]];
+        if (!file) return send(thread, '!clearnotepad [spam/reply/beef/group]');
+        fs.writeFileSync(file, '', 'utf8');
+        return send(thread, 'notepad golit');
+      }
+      case 'unsend': {
+        const last = state.lastMsg[threadId];
+        if (!last) return send(thread, 'niciun mesaj de retras');
+        try {
+          await thread.deleteItem(last);
+          delete state.lastMsg[threadId];
+          return;
+        } catch {
+          return send(thread, 'nu am putut retrage mesajul');
+        }
+      }
+      default:
+        return send(thread, `comandă necunoscută: !${cmd} — scrie !help`);
+    }
+  }
+  return undefined;
 }
 
-// ===================== AUTOMATIZARI =====================
-
-async function handleAutoFeatures(threadId, senderId, senderName, text) {
-    if (!text) return;
-
-    if (mockTargets[senderId] && Date.now() - (mockLastTime[senderId] || 0) >= replyDelay * 1000) {
-        mockLastTime[senderId] = Date.now();
-        await sendToThread(threadId, mockText(text));
-        return;
-    }
-
-    if (copyTargets[senderId] && Date.now() - (copyLastTime[senderId] || 0) >= replyDelay * 1000) {
-        copyLastTime[senderId] = Date.now();
-        await sendToThread(threadId, text);
-        return;
-    }
-
-    if (reverseMode) {
-        await sendToThread(threadId, reverseText(text));
-        return;
-    }
-
-    if (replyState.running && replyState.targets.includes(senderId) && replyWords.length) {
-        if (Date.now() - (replyState.lastReplyTime[senderId] || 0) >= replyDelay * 1000) {
-            replyState.lastReplyTime[senderId] = Date.now();
-            const line = replyWords[replyState.lineIndex % replyWords.length];
-            replyState.lineIndex += 1;
-            let out = line;
-            if (mentionTargetId && mentionTargetName) out = `@${mentionTargetName} ${out}`;
-            await sendToThread(threadId, out);
-            return;
-        }
-    }
-
-    if (afkState.active && !afkState.notified[threadId]) {
-        afkState.notified[threadId] = true;
-        await sendToThread(threadId, `Sunt AFK momentan. Motiv: ${afkState.reason}`);
-    }
+async function runSpam(thread) {
+  while (state.spam.running && state.spam.left > 0) {
+    const lines = loadLines(SPAM_NOTES_FILE);
+    await send(thread, state.spam.text || pick(lines, 'salut'));
+    state.spam.left -= 1;
+    await sleep(state.spam.delay);
+  }
+  state.spam.running = false;
 }
 
-// ===================== POLLING INBOX =====================
-
-// Extrage codul HTTP dintr-o eroare a bibliotecii instagram-private-api.
-function errorStatus(e) {
-    const direct = e && e.response && e.response.statusCode;
-    if (direct) return Number(direct);
-    const m = String((e && e.message) || '').match(/\b(4\d\d|5\d\d)\b/);
-    return m ? Number(m[1]) : 0;
+async function runRepeat(thread) {
+  while (state.repeat.running) {
+    await send(thread, state.repeat.text);
+    await sleep(state.repeat.delay);
+  }
 }
 
-// Intervalul pana la urmatoarea verificare: interval de baza + variatie
-// aleatoare, plus pauza impusa daca Instagram ne-a limitat.
-function nextPollDelay() {
-    if (pollBackoff > 0) return pollBackoff + Math.floor(Math.random() * POLL_JITTER_MS);
-    return POLL_INTERVAL_MS + Math.floor(Math.random() * POLL_JITTER_MS);
+/* ─────────────── PROCESARE MESAJE ─────────────── */
+
+async function handleMessage(thread, threadInfo, item) {
+  const senderId = String(item.user_id || '');
+  const text = typeof item.text === 'string' ? item.text.trim() : '';
+  if (!text) return;
+
+  const threadId = threadInfo.thread_id;
+  const senderName = (threadInfo.users || []).find((u) => String(u.pk) === senderId)?.username || senderId;
+  state.snipe[threadId] = { user: senderName, text, at: Date.now() };
+
+  const prefix = PREFIXES.find((p) => text.startsWith(p));
+  if (prefix) {
+    const parts = text.slice(prefix.length).trim().split(/\s+/);
+    const cmd = (parts.shift() || '').toLowerCase();
+    if (!cmd) return;
+    log(`Comandă ${prefix}${cmd} de la ${senderName}`, 'ok');
+    await handleCommand(thread, threadInfo, prefix, cmd, parts, senderId);
+    return;
+  }
+
+  // mesajele proprii nu declanșează automatizări
+  if (senderId === state.userId) return;
+
+  if (state.antitrap && /(https?:\/\/|\.ru\/|bit\.ly)/i.test(text)) {
+    await send(thread, 'link blocat de antitrap.');
+    return;
+  }
+
+  const now = Date.now();
+  if (state.lastReply[senderId] && now - state.lastReply[senderId] < state.replyDelay) return;
+
+  let response = '';
+  if (state.customReply[senderId]) response = state.customReply[senderId];
+  else if (state.copyTargets.has(senderId)) response = text;
+  else if (state.mockTargets.has(senderId)) response = mockText(text);
+  else if (state.replyTargets.has(senderId)) response = pick(loadLines(REPLY_NOTES_FILE), 'ok');
+  else if (state.afk) response = `Sunt AFK${state.afkReason ? `: ${state.afkReason}` : '.'}`;
+  else if (state.reverse) response = [...text].reverse().join('');
+
+  if (state.reactTargets[senderId]) {
+    try { await thread.markItemSeen(item.item_id); } catch {}
+  }
+
+  if (response) {
+    state.lastReply[senderId] = now;
+    await send(thread, response);
+  }
 }
 
 async function pollInbox() {
-    if (!running) return;
+  const threads = await ig.feed.directInbox().items();
+  for (const threadInfo of threads) {
+    const thread = ig.entity.directThread(threadInfo.thread_id);
+    const items = [...(threadInfo.items || [])].reverse();
+    for (const item of items) {
+      const id = String(item.item_id || '');
+      if (!id || state.seen.has(id)) continue;
+      state.seen.add(id);
+      const ms = Number(item.timestamp || 0) / 1000;
+      if (ms && ms < state.startedAt) continue;
+      if (String(item.user_id) === state.userId) state.lastMsg[threadInfo.thread_id] = id;
+      await handleMessage(thread, threadInfo, item);
+    }
+  }
+  if (state.seen.size > 3000) state.seen = new Set([...state.seen].slice(-1000));
+}
+
+async function botLoop() {
+  while (state.running) {
     try {
-        // Creeaza un feed nou la fiecare verificare. Refolosirea feedului poate
-        // pastra cursorul vechi si poate face ca mesajele noi sa nu mai apara.
-        const inboxFeed = ig.feed.directInbox();
-        const inbox = await inboxFeed.items();
-        for (const thread of inbox) {
-            const threadId = String(thread.thread_id || thread.thread_v2_id || '');
-            if (!threadId) continue;
-            const items = (thread.items || []).slice().reverse(); // de la cel mai vechi la cel mai nou
-            if (!threadCursor[threadId]) {
-                // La prima verificare procesam comenzile recente. In versiunea
-                // veche toate mesajele existente erau ignorate, inclusiv $help
-                // trimis imediat dupa pornirea botului.
-                const newest = items.length ? Number(items[items.length - 1].timestamp) : Date.now() * 1000;
-                threadCursor[threadId] = newest;
-                const recentLimit = Date.now() * 1000 - 5 * 60 * 1000 * 1000;
-                for (const item of items) {
-                    const itemId = String(item.item_id || item.client_context || '');
-                    if (itemId) seenItems.add(itemId);
-                    const text = typeof item.text === 'string' ? item.text.trim() : '';
-                    if (!text.startsWith(PREFIX) || Number(item.timestamp || 0) < recentLimit) continue;
-                    const senderId = String(item.user_id || myUserId || '');
-                    const user = (thread.users || []).find((u) => String(u.pk) === senderId);
-                    const senderName = user ? user.username : (senderId === myUserId ? USERNAME : 'necunoscut');
-                    log(`Comanda recenta de la @${senderName}: ${text}`);
-                    await handleCommand(threadId, senderId, senderName, text);
-                }
-                continue;
-            }
-
-            for (const item of items) {
-                const itemId = String(item.item_id || item.client_context || '');
-                if (itemId && seenItems.has(itemId)) continue;
-                if (itemId) seenItems.add(itemId);
-                threadCursor[threadId] = Math.max(threadCursor[threadId], Number(item.timestamp || 0));
-
-                const senderId = String(item.user_id);
-                const user = (thread.users || []).find((u) => String(u.pk) === senderId);
-                const senderName = user ? user.username : (senderId === myUserId ? USERNAME : 'necunoscut');
-                const isSelf = senderId === myUserId;
-
-                // imagini
-                if (item.item_type === 'media' || item.item_type === 'raven_media') {
-                    const url = extractImageUrl(item);
-                    if (url) await saveImageFromUrl(url, senderName, isViewOnce(item));
-                    continue;
-                }
-
-                // Unele raspunsuri Instagram nu mai trimit item_type="text",
-                // dar campul text este prezent si valid.
-                if (typeof item.text !== 'string') continue;
-                const text = String(item.text || '');
-
-                // comenzi: accepta si mesajele trimise de contul tau, in orice chat
-                if (text.trim().startsWith(PREFIX)) {
-                    log(`Comanda de la @${senderName}: ${text.trim()}`);
-                    await handleCommand(threadId, senderId, senderName, text.trim());
-                    continue;
-                }
-
-                if (isSelf) continue;
-
-                if (autolikeTargets[senderId]) await likeItem(threadId, item.item_id);
-
-                await handleAutoFeatures(threadId, senderId, senderName, text);
-            }
-        }
-        // citire reusita: resetam orice pauza impusa de erori
-        pollErrors = 0;
-        pollBackoff = 0;
-    } catch (e) {
-        pollErrors += 1;
-        const code = errorStatus(e);
-
-        if (code === 467 || code === 429) {
-            // Instagram a limitat contul/IP-ul. Nu insistam: crestem pauza.
-            pollBackoff = Math.min(pollBackoff ? pollBackoff * 2 : 60000, MAX_BACKOFF_MS);
-            log(`Instagram a limitat cererile (cod ${code}). Pauza ${Math.round(pollBackoff / 1000)}s inainte de urmatoarea verificare.`, 'warn');
-        } else if (e instanceof IgCheckpointError || /checkpoint|challenge/i.test(String(e.message))) {
-            // Cont blocat pana confirmi in aplicatia oficiala.
-            log('Instagram cere verificare de securitate. Deschide aplicatia oficiala, confirma ca esti tu, apoi scrie "start" din nou.', 'error');
-            stop();
-            return;
-        } else if (/login_required|not logged|sessionid/i.test(String(e.message))) {
-            log('Sesiunea a expirat. Scrie "logout" apoi "start" ca sa te conectezi din nou.', 'error');
-            stop();
-            return;
-        } else {
-            pollBackoff = Math.min(pollBackoff ? pollBackoff * 2 : 15000, MAX_BACKOFF_MS);
-            log(`Eroare la citirea inboxului: ${e.message}. Reincerc peste ${Math.round(pollBackoff / 1000)}s.`, 'error');
-        }
-
-        if (pollErrors >= 20) {
-            log('Prea multe erori consecutive. Opresc botul ca sa nu agravez restrictia.', 'error');
-            stop();
-            return;
-        }
+      await pollInbox();
+    } catch (error) {
+      log(`Citirea mesajelor a eșuat: ${error.message}`, 'error');
+      if (error.statusCode === 401) {
+        state.running = false;
+        state.connected = false;
+        log('Sesiunea a expirat. Rulează login.', 'warn');
+      }
     }
-
-    if (seenItems.size > 5000) seenItems.clear();
-    if (running) pollTimer = setTimeout(pollInbox, nextPollDelay());
+    if (state.running) await sleep(POLL_MS);
+  }
 }
 
-// ===================== CONTROL =====================
+/* ─────────────── CONSOLĂ ─────────────── */
 
-async function start() {
-    if (running) { log('Botul ruleaza deja.', 'warn'); return; }
-    if (!loggedIn) {
-        loginInProgress = true;
-        let ok = false;
-        try { ok = await login(); } finally { loginInProgress = false; }
-        if (!ok) { log('Nu m-am putut conecta. Verifica datele si incearca din nou cu "start".', 'error'); return; }
-    }
-    spamPhrases = loadPhrases('spam.txt');
-    replyWords = loadPhrases('reply.txt');
-    beefPhrases = loadPhrases('beef.txt');
-    running = true;
-    pollErrors = 0;
-    pollBackoff = 0;
-    log(`Bot pornit. Scrie ${PREFIX}help intr-un DM ca sa primesti lista de comenzi in acel chat.`, 'ok');
-    pollInbox();
+function showHelp() {
+  console.log(`
+${SCRIPT_NAME}
+────────────────────────────────
+ login          conectare la cont
+ start          pornește citirea DM
+ stop           oprește botul
+ status         afișează starea
+ afk [motiv]    activează/dezactivează AFK
+ comenzi        lista comenzilor din DM
+ logout         șterge sesiunea locală
+ help           afișează meniul
+ exit           închide programul
+────────────────────────────────
+În DM: $help · =help · !help
+`);
 }
 
-function stop() {
-    if (!running) { log('Botul nu ruleaza.', 'warn'); return; }
-    running = false;
-    if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
-    if (spamState.timer) { clearInterval(spamState.timer); spamState.timer = null; spamState.running = false; }
-    log('Bot oprit.', 'ok');
+async function command(input) {
+  const [name = '', ...args] = input.trim().split(/\s+/);
+  switch (name.toLowerCase()) {
+    case 'login':
+      await login();
+      break;
+    case 'start':
+      if (state.running) return log('Botul rulează deja.', 'warn');
+      if (!state.connected && !(await login())) return true;
+      state.startedAt = Date.now();
+      state.running = true;
+      log(`Bot pornit. Citesc DM la fiecare ${POLL_MS / 1000}s.`, 'ok');
+      botLoop();
+      break;
+    case 'stop':
+      state.running = false;
+      log('Bot oprit.', 'ok');
+      break;
+    case 'status':
+      console.log(`Conectat: ${state.connected ? `da (@${state.username})` : 'nu'} | Rulează: ${state.running ? 'da' : 'nu'} | AFK: ${state.afk ? 'da' : 'nu'} | Uptime: ${uptime()}`);
+      break;
+    case 'afk':
+      state.afk = !state.afk;
+      state.afkReason = state.afk ? args.join(' ') : '';
+      log(`AFK ${state.afk ? 'activat' : 'dezactivat'}.`, 'ok');
+      break;
+    case 'comenzi':
+      console.log(`\n${HELP_DOLLAR}\n\n${HELP_EQUAL}\n\n${HELP_EXCL}\n`);
+      break;
+    case 'logout':
+      deleteSession();
+      log('Sesiune ștearsă.', 'ok');
+      break;
+    case 'help':
+    case '?':
+      showHelp();
+      break;
+    case 'exit':
+    case 'quit':
+      state.running = false;
+      return false;
+    case '':
+      break;
+    default:
+      log(`Comandă necunoscută: ${name}. Scrie help.`, 'error');
+  }
+  return true;
 }
 
-function consoleHelp() {
-    console.log([
-        '',
-        'COMENZI CONSOLA (control)',
-        '  start    - porneste botul (cere login prima data)',
-        '  stop     - opreste botul',
-        '  status   - afiseaza starea botului',
-        '  logout   - sterge sesiunea salvata',
-        '  help     - acest mesaj',
-        '  commands - lista completa a comenzilor de bot',
-        '  exit     - inchide programul',
-        '',
-        'COMENZI DE BOT DIN TERMINAL',
-        `  Orice comanda ${PREFIX} merge si aici, cu sau fara prefix.`,
-        `  Exemple: ${PREFIX}spam user text | mock user | note list | clearall`,
-        '  Raspunsul apare in terminal, actiunea se executa pe Instagram.',
-        '',
-        `In DM foloseste prefixul ${PREFIX}. Scrie ${PREFIX}help intr-un chat si botul raspunde acolo.`,
-        '',
-    ].join('\n'));
+async function main() {
+  console.clear();
+  showHelp();
+  await restoreSession();
+  let active = true;
+  while (active) {
+    const input = readlineSync.question('instagram-bot > ');
+    active = (await command(input)) !== false;
+  }
+  console.log('La revedere.');
 }
 
-// Comenzi de bot rulate din terminal: acelasi handler ca in DM,
-// doar ca raspunsul se scrie in consola.
-const NEEDS_LOGIN = new Set([
-    'reply', 'stopreply', 'spam', 'mock', 'stopmock', 'copymsg', 'stopcopy',
-    'autolike', 'stopautolike', 'mention', 'target',
-]);
-
-// Comenzile din terminal se executa una dupa alta, in ordinea scrierii.
-let consoleQueue = Promise.resolve();
-
-function queueBotCommand(raw) {
-    consoleQueue = consoleQueue.then(() => runBotCommand(raw)).catch((e) => {
-        log(`Comanda a esuat: ${e && e.message ? e.message : e}`, 'error');
-    });
-}
-
-async function runBotCommand(raw) {
-    const clean = raw.trim();
-    if (!clean) return;
-    const name = clean.replace(new RegExp(`^\\${PREFIX}`), '').trim().split(/\s+/)[0].toLowerCase();
-    if (NEEDS_LOGIN.has(name) && !loggedIn) {
-        // daca tocmai se face login (pornire automata), asteptam sa se termine
-        if (loginInProgress) {
-            log('Astept sa se termine loginul...');
-            for (let i = 0; i < 120 && loginInProgress; i += 1) await sleep(1000);
-        }
-        if (!loggedIn) {
-            console.log('Trebuie sa fii conectat. Scrie "start" mai intai.');
-            return;
-        }
-    }
-    try {
-        await handleCommand('', String(myUserId || 'console'), USERNAME || 'consola', clean, (msg) => {
-            console.log(`\n${msg}\n`);
-            return true;
-        });
-    } catch (e) {
-        log(`Comanda a esuat: ${e.message}`, 'error');
-    }
-}
-
-const consoleCommands = {
-    start,
-    stop,
-    status: () => console.log(`\n${statusText()}\n`),
-    help: consoleHelp,
-    logout: () => {
-        try { fs.unlinkSync(SESSION_FILE); log('Sesiune stearsa.', 'ok'); } catch { log('Nu exista sesiune salvata.', 'warn'); }
-        loggedIn = false;
-    },
-    commands: () => console.log(`\n${helpText()}\n`),
-    comenzi: () => console.log(`\n${helpText()}\n`),
-    exit: () => { stop(); process.exit(0); },
-    quit: () => { stop(); process.exit(0); },
-};
-
-cli = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
-cli.on('line', (line) => {
-    if (inputBusy) return; // randul apartine unei intrebari de login
-    const raw = line.trim();
-    if (!raw) return;
-    const key = raw.toLowerCase();
-    // comenzile de control merg doar fara argumente si fara prefix
-    if (!raw.startsWith(PREFIX) && consoleCommands[key]) { consoleCommands[key](); return; }
-    queueBotCommand(raw);
+process.on('SIGINT', () => {
+  state.running = false;
+  console.log('\nProgram închis.');
+  process.exit(0);
 });
-cli.on('close', () => { /* stdin inchis (nohup/systemd): botul continua sa ruleze */ });
 
-process.on('SIGINT', () => { stop(); process.exit(0); });
-process.on('SIGTERM', () => { stop(); process.exit(0); });
-process.on('uncaughtException', (err) => log(`Exceptie: ${err.message}`, 'error'));
-process.on('unhandledRejection', (err) => log(`Promisiune respinsa: ${err && err.message ? err.message : err}`, 'error'));
-
-console.log([
-    '',
-    '==============================',
-    '   INSTAGRAM BOT',
-    '==============================',
-    '',
-    `Mod: ${HEADLESS ? 'headless (server / VPS)' : 'interactiv (terminal)'}`,
-    `Date salvate in: ${DATA_DIR}`,
-    '',
-    'Scrie "start" pentru a porni botul.',
-    'Scrie "help" pentru comenzile din consola.',
-    `Orice comanda de bot merge si aici (ex: "${PREFIX}status" sau "status").`,
-    '',
-].join('\n'));
-
-if (AUTO_START) {
-    if (HEADLESS && !fs.existsSync(SESSION_FILE) && !process.env.IG_USERNAME) {
-        log('Mod headless fara sesiune salvata si fara IG_USERNAME/IG_PASSWORD in .env. Nu pot face login.', 'error');
-    } else {
-        start();
-    }
-}
+main().catch((error) => {
+  log(error.message, 'error');
+  process.exitCode = 1;
+});
