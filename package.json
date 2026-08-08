@@ -1,24 +1,22 @@
 {
   "name": "instagram-bot",
-  "version": "4.0.0",
-  "description": "Bot Instagram cu comenzi in DM si in terminal, login 2FA, sesiune persistenta, rulare pe Termux / localhost / VPS",
+  "version": "5.0.0",
+  "description": "Bot Instagram cu set complet de comenzi in DM ($ = !), login 2FA si sesiune persistenta",
   "main": "instagram-bot.js",
   "scripts": {
-    "start": "node instagram-bot.js",
-    "auto": "node instagram-bot.js --auto",
-    "server": "node instagram-bot.js --headless --auto"
+    "start": "node instagram-bot.js"
   },
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
-    "instagram-private-api": "^1.46.1"
+    "instagram-private-api": "^1.46.1",
+    "readline-sync": "^1.4.10"
   },
   "keywords": [
     "instagram",
     "bot",
     "termux",
-    "vps",
     "cli"
   ],
   "author": "curumatipulan-dev",
